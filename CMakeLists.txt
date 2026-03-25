@@ -197,10 +197,102 @@ if(BUILD_LV2)
     )
 
     target_compile_features(NeuralNoteGuitar2Midi_LV2 PRIVATE cxx_std_17)
+
+    # ── SIMD auto-detection ──────────────────────────────────────────────────
+    # cmake_cxx_source_runs() compiles *and executes* a small probe program on
+    # the build host.  Because we build directly on the target Pi (not cross-
+    # compiling), this correctly distinguishes:
+    #
+    #   Raspberry Pi 4  (Cortex-A72, ARMv8-A)    →  armv8-a+neon
+    #   Raspberry Pi 5  (Cortex-A76, ARMv8.2-A)  →  armv8.2-a+dotprod+fp16
+    #   x86-64 with AVX2 + FMA                    →  avx2+fma
+    #   x86-64 with SSE4.2                        →  sse4.2
+    #
+    # The detected level is baked into NEURALNOTE_SIMD_LEVEL (a string) so the
+    # plugin can log it at instantiation time.  Results are CMake-cached; wipe
+    # the build directory or run cmake with -UNEURALNOTE_HAVE_* to re-probe.
+    include(CheckCXXSourceRuns)
+
+    set(_NN_MARCH "")          # -march=<value>; empty = let compiler choose
+    set(_NN_SIMD  "baseline")  # human-readable label passed to the plugin
+
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        # ── AArch64 ───────────────────────────────────────────────────────────
+        # Probe ARMv8.2-A + dotprod + fp16 (Raspberry Pi 5 / Cortex-A76).
+        # The sdot instruction raises SIGILL on Pi 4 (ARMv8-A / Cortex-A72),
+        # so the run-test naturally fails there and we fall back to plain NEON.
+        set(CMAKE_REQUIRED_FLAGS "-march=armv8.2-a+dotprod+fp16")
+        check_cxx_source_runs([[
+            #include <arm_neon.h>
+            int main() {
+                int32x4_t acc = vdupq_n_s32(0);
+                int8x16_t a = vdupq_n_s8(3), b = vdupq_n_s8(2);
+                acc = vdotq_s32(acc, a, b);  /* sdot: ARMv8.2-A only */
+                return (vgetq_lane_s32(acc, 0) == 24) ? 0 : 1;
+            }
+        ]] NEURALNOTE_HAVE_ARMV82_DOTPROD)
+        unset(CMAKE_REQUIRED_FLAGS)
+
+        if(NEURALNOTE_HAVE_ARMV82_DOTPROD)
+            set(_NN_MARCH "armv8.2-a+dotprod+fp16")
+            set(_NN_SIMD  "armv8.2-a+dotprod+fp16")
+        else()
+            # Probe baseline ARMv8-A NEON (Raspberry Pi 4 / Cortex-A72)
+            set(CMAKE_REQUIRED_FLAGS "-march=armv8-a+simd")
+            check_cxx_source_runs([[
+                #include <arm_neon.h>
+                int main() {
+                    float32x4_t a = vdupq_n_f32(1.0f), b = vdupq_n_f32(2.0f);
+                    float32x4_t c = vmulq_f32(a, b);
+                    return (vgetq_lane_f32(c, 0) > 1.9f) ? 0 : 1;
+                }
+            ]] NEURALNOTE_HAVE_NEON)
+            unset(CMAKE_REQUIRED_FLAGS)
+            if(NEURALNOTE_HAVE_NEON)
+                set(_NN_MARCH "armv8-a+simd")
+                set(_NN_SIMD  "armv8-a+neon")
+            endif()
+        endif()
+
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        # ── x86-64 ────────────────────────────────────────────────────────────
+        set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma")
+        check_cxx_source_runs([[
+            #include <immintrin.h>
+            int main() {
+                __m256 a = _mm256_set1_ps(1.5f), b = _mm256_set1_ps(2.0f);
+                __m256 c = _mm256_mul_ps(a, b);
+                float r[8]; _mm256_storeu_ps(r, c);
+                return (r[0] > 2.9f) ? 0 : 1;
+            }
+        ]] NEURALNOTE_HAVE_AVX2)
+        unset(CMAKE_REQUIRED_FLAGS)
+
+        if(NEURALNOTE_HAVE_AVX2)
+            target_compile_options(NeuralNoteGuitar2Midi_LV2 PRIVATE -mavx2 -mfma)
+            set(_NN_SIMD "avx2+fma")
+        else()
+            set(CMAKE_REQUIRED_FLAGS "-msse4.2")
+            check_cxx_source_runs([[
+                #include <nmmintrin.h>
+                int main() {
+                    __m128i a = _mm_set1_epi32(42);
+                    return (_mm_extract_epi32(a, 0) == 42) ? 0 : 1;
+                }
+            ]] NEURALNOTE_HAVE_SSE42)
+            unset(CMAKE_REQUIRED_FLAGS)
+            if(NEURALNOTE_HAVE_SSE42)
+                target_compile_options(NeuralNoteGuitar2Midi_LV2 PRIVATE -msse4.2)
+                set(_NN_SIMD "sse4.2")
+            endif()
+        endif()
+    endif()
+
+    message(STATUS "LV2 SIMD: ${_NN_SIMD}  (march=${_NN_MARCH})")
+
     target_compile_options(NeuralNoteGuitar2Midi_LV2 PRIVATE
         -O2 -ffast-math -fPIC
-        # NEON SIMD for aarch64 — matches Pisound + Pi 5 hardware
-        -march=armv8-a+simd
+        $<$<BOOL:${_NN_MARCH}>:-march=${_NN_MARCH}>
     )
 
     # Include paths — LV2/ must come first so BinaryData.h and NoteUtils.h
@@ -216,6 +308,7 @@ if(BUILD_LV2)
     target_compile_definitions(NeuralNoteGuitar2Midi_LV2 PRIVATE
         SAVE_DOWNSAMPLED_AUDIO=0
         USE_TEST_NOTE_FRAME_TO_TIME=0
+        NEURALNOTE_SIMD_LEVEL="${_NN_SIMD}"
     )
 
     # Link onnxruntime static lib + RTNeural + system LV2

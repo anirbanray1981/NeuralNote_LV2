@@ -75,6 +75,43 @@ cmake -B build_lv2 \
 cmake --build build_lv2 --target NeuralNoteGuitar2Midi_LV2 -j$(nproc)
 ```
 
+### SIMD auto-detection
+
+CMake probes the build host at configure time by **compiling and executing** a
+small test program for each SIMD level.  Because the build runs directly on the
+target Pi (no cross-compilation), a Pi 4 will naturally fail the ARMv8.2-A
+`sdot` probe (SIGILL) and fall back to NEON, while a Pi 5 will pass it.
+
+| Platform | Detected level | `-march` flag |
+|----------|---------------|---------------|
+| Raspberry Pi 5 (Cortex-A76) | `armv8.2-a+dotprod+fp16` | `-march=armv8.2-a+dotprod+fp16` |
+| Raspberry Pi 4 (Cortex-A72) | `armv8-a+neon` | `-march=armv8-a+simd` |
+| x86-64 with AVX2 | `avx2+fma` | `-mavx2 -mfma` |
+| x86-64 without AVX2 | `sse4.2` | `-msse4.2` |
+| Other | `baseline` | *(none)* |
+
+The configure output will show the detected level:
+
+```
+-- LV2 SIMD: armv8.2-a+dotprod+fp16  (march=armv8.2-a+dotprod+fp16)
+```
+
+The detected level is also baked into the plugin binary as the
+`NEURALNOTE_SIMD_LEVEL` string and logged by the LV2 host on load:
+
+```
+NeuralNote Guitar2MIDI: instantiated at 48000 Hz  [SIMD: armv8.2-a+dotprod+fp16]
+```
+
+To force a re-probe (e.g. after moving the build directory to a different
+machine), wipe the cached results and re-run cmake:
+
+```bash
+cmake -B build_lv2 -UNEURALNOTE_HAVE_ARMV82_DOTPROD -UNEURALNOTE_HAVE_NEON \
+      -UNEURALNOTE_HAVE_AVX2 -UNEURALNOTE_HAVE_SSE42 \
+      -DBUILD_LV2=ON -DCMAKE_BUILD_TYPE=Release
+```
+
 On success the bundle is assembled at:
 
 ```

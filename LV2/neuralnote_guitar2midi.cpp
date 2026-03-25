@@ -147,7 +147,8 @@ static LV2_Handle instantiate(const LV2_Descriptor*     descriptor,
     memset(self->noteActive, 0, sizeof(self->noteActive));
 
     lv2_log_note(&self->logger,
-                 "NeuralNote Guitar2MIDI: instantiated at %.0f Hz\n", rate);
+                 "NeuralNote Guitar2MIDI: instantiated at %.0f Hz  [SIMD: %s]\n",
+                 rate, NEURALNOTE_SIMD_LEVEL);
     return static_cast<LV2_Handle>(self);
 }
 

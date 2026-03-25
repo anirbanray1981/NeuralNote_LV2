@@ -1,0 +1,40 @@
+@prefix atom:  <http://lv2plug.in/ns/ext/atom#> .
+@prefix doap:  <http://usefulinc.com/ns/doap#> .
+@prefix lv2:   <http://lv2plug.in/ns/lv2core#> .
+@prefix midi:  <http://lv2plug.in/ns/ext/midi#> .
+@prefix pg:    <http://lv2plug.in/ns/ext/port-groups#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix urid:  <http://lv2plug.in/ns/ext/urid#> .
+@prefix units: <http://lv2plug.in/ns/extensions/units#> .
+
+<https://github.com/DamRsn/NeuralNote/guitar2midi>
+    a lv2:Plugin, lv2:ConverterPlugin ;
+    doap:name        "NeuralNote Guitar2MIDI" ;
+    doap:license     <http://opensource.org/licenses/Apache-2.0> ;
+    doap:maintainer  [ doap:name "Damien Ronssin" ] ;
+    lv2:requiredFeature urid:map ;
+    lv2:optionalFeature lv2:hardRTCapable ;
+
+    lv2:port [
+        a lv2:AudioPort, lv2:InputPort ;
+        lv2:index 0 ;
+        lv2:symbol "audio_in" ;
+        lv2:name   "Guitar Audio In" ;
+    ] , [
+        a atom:AtomPort, lv2:OutputPort ;
+        atom:bufferType atom:Sequence ;
+        atom:supports   midi:MidiEvent ;
+        lv2:index  1 ;
+        lv2:symbol "midi_out" ;
+        lv2:name   "MIDI Out" ;
+        lv2:designation lv2:control ;
+    ] , [
+        a lv2:ControlPort, lv2:InputPort ;
+        lv2:index   2 ;
+        lv2:symbol  "threshold" ;
+        lv2:name    "Onset sensitivity" ;
+        lv2:default 0.7 ;
+        lv2:minimum 0.1 ;
+        lv2:maximum 1.0 ;
+        units:unit  units:coef ;
+    ] .

@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <cstdlib>
@@ -85,10 +86,14 @@ static inline int modeToRingSize(float mode)
 // ── Port indices ──────────────────────────────────────────────────────────────
 
 enum PortIndex {
-    PORT_AUDIO_IN = 0,
-    PORT_MIDI_OUT = 1,
+    PORT_AUDIO_IN  = 0,
+    PORT_MIDI_OUT  = 1,
     PORT_THRESHOLD = 2,
-    PORT_MODE = 3,
+    PORT_MODE      = 3,
+    PORT_AUDIO_OUT = 4,
+    PORT_GATE      = 5,
+    PORT_MIN_DUR   = 6,
+    PORT_AMP_FLOOR = 7,
 };
 
 // ── Mapped URIDs ──────────────────────────────────────────────────────────────
@@ -121,18 +126,23 @@ struct NeuralNotePlugin {
 
     // Ports
     const float*       audioIn;
+    float*             audioOut;
     LV2_Atom_Sequence* midiOut;
     const float*       threshold;
     const float*       mode;      // 0=Fast 300ms  1=Medium 500ms  2=Slow 1000ms
+    const float*       gate;      // noise gate floor (linear RMS, default 0.003 ≈ -50 dBFS)
+    const float*       minDur;    // minimum note duration in ms (default 100)
+    const float*       ampFloor;  // minimum note amplitude 0.0-1.0 (default 0.65)
 
     // Inference engine — only accessed by the worker thread after init
     std::unique_ptr<BasicPitch> basicPitch;
     double sampleRate;
 
     // Parameters: written by run(), read by worker (atomic for safety)
-    std::atomic<float> noteSensitivity{0.7f};
+    std::atomic<float> noteSensitivity{0.5f};
     std::atomic<float> splitSensitivity{0.5f};
-    std::atomic<float> minNoteLengthMs{50.0f};
+    std::atomic<float> minNoteLengthMs{100.0f};
+    std::atomic<float> ampFloorVal{0.65f};
 
     // ── Ring buffer (22050-Hz resampled audio, circular) ──────────────────
     // Allocated at RING_MAX (1000 ms); ringSize tracks the active window.
@@ -185,10 +195,12 @@ static void runWorker(NeuralNotePlugin* self)
             self->minNoteLengthMs.load(std::memory_order_relaxed));
         self->basicPitch->transcribeToMIDI(snap.data(), static_cast<int>(snap.size()));
 
-        // Build pitch set from inference result
+        // Build pitch set from inference result, filtering by amplitude floor
+        const float ampFloor = self->ampFloorVal.load(std::memory_order_relaxed);
         std::set<uint8_t>          newSet;
         std::map<uint8_t, uint8_t> velMap;
         for (const auto& ev : self->basicPitch->getNoteEvents()) {
+            if (static_cast<float>(ev.amplitude) < ampFloor) continue;
             const auto p = static_cast<uint8_t>(std::clamp(ev.pitch, 0, 127));
             const auto v = static_cast<uint8_t>(
                 std::clamp(static_cast<int>(ev.amplitude * 127.0), 1, 127));
@@ -286,7 +298,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
     }
 
     self->basicPitch = std::make_unique<BasicPitch>();
-    self->basicPitch->setParameters(0.7f, 0.5f, 50.0f);
+    self->basicPitch->setParameters(0.5f, 0.5f, 100.0f); // threshold, split, minDurMs
 
     memset(self->ringBuf, 0, sizeof(self->ringBuf));
 
@@ -304,9 +316,13 @@ static void connectPort(LV2_Handle instance, uint32_t port, void* data)
     NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
     switch (static_cast<PortIndex>(port)) {
         case PORT_AUDIO_IN:  self->audioIn   = static_cast<const float*>(data);       break;
+        case PORT_AUDIO_OUT: self->audioOut  = static_cast<float*>(data);             break;
         case PORT_MIDI_OUT:  self->midiOut   = static_cast<LV2_Atom_Sequence*>(data); break;
         case PORT_THRESHOLD: self->threshold = static_cast<const float*>(data);       break;
         case PORT_MODE:      self->mode      = static_cast<const float*>(data);       break;
+        case PORT_GATE:      self->gate      = static_cast<const float*>(data);       break;
+        case PORT_MIN_DUR:   self->minDur    = static_cast<const float*>(data);       break;
+        case PORT_AMP_FLOOR: self->ampFloor  = static_cast<const float*>(data);       break;
     }
 }
 
@@ -352,9 +368,13 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         self->pendingMidi.clear();
     }
 
-    // Update sensitivity from control port
+    // Update parameters from control ports
     if (self->threshold)
         self->noteSensitivity.store(*self->threshold, std::memory_order_relaxed);
+    if (self->minDur)
+        self->minNoteLengthMs.store(*self->minDur, std::memory_order_relaxed);
+    if (self->ampFloor)
+        self->ampFloorVal.store(*self->ampFloor, std::memory_order_relaxed);
 
     // Handle mode changes (Fast / Medium / Slow window size).
     // When the mode port changes we reset the ring so the worker immediately
@@ -374,8 +394,32 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         }
     }
 
-    // Resample host block to 22050 Hz and push into circular ring buffer
-    pushToRing(self, self->audioIn, static_cast<int>(nSamples));
+    // Output silence — audio_out exists only so Zynthian classifies this as
+    // an audio-effect chain entry; no dry signal is passed through.
+    if (self->audioOut)
+        std::memset(self->audioOut, 0, nSamples * sizeof(float));
+
+    // Noise gate: compute block RMS; if below floor push silence so the ring
+    // flushes out old audio and BasicPitch sees a quiet window.
+    {
+        const float gateFloor = (self->gate && *self->gate > 0.0f) ? *self->gate : 0.003f;
+        float sumSq = 0.0f;
+        for (uint32_t i = 0; i < nSamples; ++i)
+            sumSq += self->audioIn[i] * self->audioIn[i];
+        const float rms = std::sqrt(sumSq / static_cast<float>(nSamples));
+        if (rms >= gateFloor) {
+            pushToRing(self, self->audioIn, static_cast<int>(nSamples));
+        } else {
+            // Fill ring slot with zeros (advancing head keeps timing correct)
+            static const float zeros[8192] = {};
+            int remaining = static_cast<int>(nSamples);
+            while (remaining > 0) {
+                const int chunk = std::min(remaining, 8192);
+                pushToRing(self, zeros, chunk);
+                remaining -= chunk;
+            }
+        }
+    }
 
     // Hand the latest ring snapshot to the worker (non-blocking).
     // try_to_lock ensures we never stall the audio thread.

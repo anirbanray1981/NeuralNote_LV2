@@ -108,38 +108,10 @@ struct SynthVoice {
     float  velocity = 0.0f; int state = 0; float envLevel = 0.0f;
 };
 
-struct PendingNote { bool noteOn; int pitch; float velocity; };
-
-// ── Lockless SPSC MIDI output queue (worker → jackProcess) ────────────────────
-// (SnapshotChannel is defined in NeuralNoteShared.h)
-
-struct MidiOutQueue {
-    PendingNote      buf[MIDI_QUEUE_CAP];
-    std::atomic<int> head{0};
-    std::atomic<int> tail{0};
-
-    void push(PendingNote n) {
-        const int t    = tail.load(std::memory_order_relaxed);
-        const int next = (t + 1) % MIDI_QUEUE_CAP;
-        if (next == head.load(std::memory_order_acquire)) return;
-        buf[t] = n;
-        tail.store(next, std::memory_order_release);
-    }
-    bool pop(PendingNote& out) {
-        const int h = head.load(std::memory_order_relaxed);
-        if (h == tail.load(std::memory_order_acquire)) return false;
-        out = buf[h];
-        head.store((h + 1) % MIDI_QUEUE_CAP, std::memory_order_release);
-        return true;
-    }
-};
-
 // ── Per-range runtime state ────────────────────────────────────────────────────
-// All common fields live in RangeStateBase (NeuralNoteShared.h).
+// All common fields (including MidiOutQueue midiOut) live in RangeStateBase.
 
 struct RangeState : RangeStateBase {
-    MidiOutQueue midiOut;  // worker → jackProcess (int pitch, float velocity)
-
     // tune-specific fields
     int    provMidiPitch  = -1;   // set by OBP, consumed by processSynth this callback
     double provOnTimeMs   = 0.0;  // ms since startTime when provisional fired
@@ -185,9 +157,11 @@ static Monitor*          g_mon = nullptr;
 static std::atomic<bool> g_quit{false};
 static void onSignal(int) { g_quit.store(true); }
 
-// ── Worker thread (one per range) ──────────────────────────────────────────────
+// ── Worker thread ──────────────────────────────────────────────────────────────
 
-// newBits: bitmap of CNN-detected notes; newVel[i]: velocity for bit i.
+// newBits: bitmap of CNN-detected notes; newVel[i]: velocity (0–127) for bit i.
+// Handles OBP hold (tune-specific) and CNN outcome logging, then delegates the
+// note ON/OFF/hold state machine to the shared applyNotesDiff helper.
 static void applyRangeDiff(Monitor* m, RangeState& r,
                            uint64_t newBits, const int8_t* newVel,
                            double inferMs, int prov)
@@ -233,33 +207,16 @@ static void applyRangeDiff(Monitor* m, RangeState& r,
                         inferMs, r.cfg.name.c_str());
         }
         std::fflush(stdout);
-        // CNN did not confirm provisional — blacklist it so OBP can't fire it again
-        // on the very next onset (one-onset suppression only).
-        if (!bmTest(newBits, prov))
-            r.obdBlacklistNote.store(prov, std::memory_order_release);
     }
 
-    // If CNN cancelled/corrected the OBP provisional and it's already sitting in the
-    // hold-countdown queue from a previous cycle, force-expire it immediately so the
-    // decrement loop below sends the OFF this cycle instead of waiting holdCycles more.
-    if (prov != -1 && prov >= NOTE_BASE && prov < NOTE_BASE + NOTE_COUNT
-        && !bmTest(newBits, prov)) {
-        const int provBit = prov - NOTE_BASE;
-        if (r.holdNotes & (1ULL << provBit))
-            r.holdCounts[provBit] = 1;  // decrement to 0 below → OFF this cycle
-    }
+    // Snapshot active state for post-diff logging
+    const uint64_t preActive = r.activeNotes;
 
-    // ── Note-ONs: in newBits, not yet active ─────────────────────────────────
-    // Cancel any pending hold for notes that came back.
-    {
-        const uint64_t returning = newBits & r.holdNotes;
-        for (uint64_t tmp = returning; tmp; tmp &= tmp - 1) {
-            const int bit = __builtin_ctzll(tmp);
-            r.holdCounts[bit] = 0;
-        }
-        r.holdNotes &= ~returning;
-    }
-    for (uint64_t tmp = newBits & ~r.activeNotes; tmp; tmp &= tmp - 1) {
+    // Shared note ON/OFF/hold state machine (blacklist, force-expire, push events)
+    applyNotesDiff(r, newBits, newVel, prov);
+
+    // Log note-ONs (notes that became active this cycle)
+    for (uint64_t tmp = r.activeNotes & ~preActive; tmp; tmp &= tmp - 1) {
         const int bit = __builtin_ctzll(tmp);
         const int p   = NOTE_BASE + bit;
         std::printf("[+%.3fs]  ON   %-4s (%3d)  vel %3d"
@@ -267,40 +224,12 @@ static void applyRangeDiff(Monitor* m, RangeState& r,
                     elapsed, midiToName(p).c_str(), p, newVel[bit],
                     r.cfg.windowMs, inferMs, r.cfg.name.c_str());
         std::fflush(stdout);
-        r.midiOut.push({true, p, newVel[bit] / 127.0f});
-        r.activeNotes |= (1ULL << bit);
     }
-
-    // ── Decrement holds; send note-OFF for expired ones ───────────────────────
-    for (uint64_t tmp = r.holdNotes; tmp; tmp &= tmp - 1) {
-        const int bit = __builtin_ctzll(tmp);
-        if (--r.holdCounts[bit] <= 0) {
-            const int p = NOTE_BASE + bit;
-            std::printf("[+%.3fs]  OFF  %-4s (%3d)\n", elapsed, midiToName(p).c_str(), p);
-            std::fflush(stdout);
-            r.midiOut.push({false, p, 0.0f});
-            r.activeNotes &= ~(1ULL << bit);
-            r.holdNotes   &= ~(1ULL << bit);
-            r.holdCounts[bit] = 0;
-        }
-    }
-
-    // ── Active notes absent from newBits and not in hold → start hold or OFF ──
-    for (uint64_t tmp = r.activeNotes & ~newBits & ~r.holdNotes; tmp; tmp &= tmp - 1) {
-        const int bit = __builtin_ctzll(tmp);
-        const int p   = NOTE_BASE + bit;
-        // A cancelled/corrected OBP provisional was never CNN-confirmed — skip hold,
-        // send OFF immediately rather than waiting holdCycles more inference cycles.
-        const bool cancelledProv = (prov != -1 && p == prov && !bmTest(newBits, prov));
-        if (r.cfg.holdCycles > 0 && !cancelledProv) {
-            r.holdNotes      |= (1ULL << bit);
-            r.holdCounts[bit]  = static_cast<int8_t>(r.cfg.holdCycles);
-        } else {
-            std::printf("[+%.3fs]  OFF  %-4s (%3d)\n", elapsed, midiToName(p).c_str(), p);
-            std::fflush(stdout);
-            r.midiOut.push({false, p, 0.0f});
-            r.activeNotes &= ~(1ULL << bit);
-        }
+    // Log note-OFFs (notes that left active this cycle)
+    for (uint64_t tmp = preActive & ~r.activeNotes; tmp; tmp &= tmp - 1) {
+        const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
+        std::printf("[+%.3fs]  OFF  %-4s (%3d)\n", elapsed, midiToName(p).c_str(), p);
+        std::fflush(stdout);
     }
 }
 
@@ -335,7 +264,7 @@ static void runWorker(Monitor* m)
                     r.pendingProvNote = snapProv;  // persist identity across hold inferences
                 } else {
                     // Out-of-bitmap provisional: CNN can never track it, send OFF now.
-                    r.midiOut.push({false, snapProv, 0.0f});
+                    r.midiOut.push({false, snapProv, 0});
                     r.pendingProvNote = -1;
                 }
             }
@@ -376,10 +305,10 @@ static void runWorker(Monitor* m)
     for (auto& rp : m->ranges) {
         RangeState& r = *rp;
         for (uint64_t tmp = r.activeNotes; tmp; tmp &= tmp - 1) {
-            const int p = NOTE_BASE + __builtin_ctzll(tmp);
+            const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
             std::printf("[+%.3fs]  OFF  %-4s (%3d)  [shutdown]\n",
                         elapsed, midiToName(p).c_str(), p);
-            r.midiOut.push({false, p, 0.0f});
+            r.midiOut.push({false, p, 0});
         }
         r.activeNotes = 0;
         r.holdNotes   = 0;
@@ -463,7 +392,7 @@ static void processSynth(Monitor* m, float* out, int nFrames)
                     const float l = m->voices[i].envLevel;
                     if (l < bestLevel) { bestLevel = l; best = i; }
                 }
-                m->voices[best] = { pn.pitch, midiToFreq(pn.pitch), 0.0, pn.velocity, 1, 0.0f };
+                m->voices[best] = { pn.pitch, midiToFreq(pn.pitch), 0.0, pn.velocity / 127.0f, 1, 0.0f };
             } else {
                 for (int i = 0; i < MAX_VOICES; ++i)
                     if (m->voices[i].pitch == pn.pitch && m->voices[i].state != 0)

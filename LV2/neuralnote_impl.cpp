@@ -96,49 +96,13 @@ static void mapURIs(LV2_URID_Map* map, URIs* uris)
     uris->midi_MidiEvent     = map->map(map->handle, LV2_MIDI__MidiEvent);
 }
 
-// ── Pending MIDI event ────────────────────────────────────────────────────────
-
-struct PendingNote { bool noteOn; uint8_t pitch; uint8_t velocity; };
-
-// ── Lockless SPSC MIDI output queue (worker → run()) ─────────────────────────
-// (SnapshotChannel is defined in NeuralNoteShared.h)
-//
-// Standard single-producer / single-consumer ring buffer.
-// Producer: worker thread.  Consumer: run().
-
-struct MidiOutQueue {
-    PendingNote      buf[MIDI_QUEUE_CAP];
-    std::atomic<int> head{0};   // run() advances
-    std::atomic<int> tail{0};   // worker advances
-
-    // Called from worker thread only.
-    void push(PendingNote n) {
-        const int t    = tail.load(std::memory_order_relaxed);
-        const int next = (t + 1) % MIDI_QUEUE_CAP;
-        if (next == head.load(std::memory_order_acquire)) return; // drop if full
-        buf[t] = n;
-        tail.store(next, std::memory_order_release);
-    }
-
-    // Called from run() only.
-    bool pop(PendingNote& out) {
-        const int h = head.load(std::memory_order_relaxed);
-        if (h == tail.load(std::memory_order_acquire)) return false;
-        out = buf[h];
-        head.store((h + 1) % MIDI_QUEUE_CAP, std::memory_order_release);
-        return true;
-    }
-};
-
 // Forward declaration
 struct NeuralNotePlugin;
 
 // ── Per-range runtime state ───────────────────────────────────────────────────
-// All common fields live in RangeStateBase (NeuralNoteShared.h).
+// All common fields (including MidiOutQueue midiOut) live in RangeStateBase.
 
-struct PerRangeState : RangeStateBase {
-    MidiOutQueue midiOut;  // worker → run() (uint8_t pitch/velocity)
-
+struct RangeState : RangeStateBase {
     // LV2 single-range mode: run() writes these; worker reads them.
     // Ordering guaranteed by the semaphore post/wait on snapChan.
     std::atomic<float> onsetSensitivity{0.6f};
@@ -177,7 +141,7 @@ struct NeuralNotePlugin {
     float lastMinNoteFrames{6.0f};
     float lastAmpFloor{0.65f};
 
-    std::vector<std::unique_ptr<PerRangeState>> ranges;
+    std::vector<std::unique_ptr<RangeState>> ranges;
     bool singleRangeMode = true;
 
     // Onset detector state (run() thread only — no synchronisation needed)
@@ -190,78 +154,7 @@ struct NeuralNotePlugin {
     sem_t             workerSem;
 };
 
-// ── Worker thread (one per range) ─────────────────────────────────────────────
-
-static void applyRangeDiff(PerRangeState& r, float ampFloor, int prov = -1)
-{
-    // Build CNN result as bitmap + velocity array
-    uint64_t newBits = 0;
-    int8_t   newVel[NOTE_COUNT] = {};
-    for (const auto& ev : r.basicPitch->getNoteEvents()) {
-        if (static_cast<float>(ev.amplitude) < ampFloor) continue;
-        const int p = static_cast<int>(ev.pitch);
-        if (p < r.cfg.midiLow || p > r.cfg.midiHigh) continue;
-        if (p < NOTE_BASE || p >= NOTE_BASE + NOTE_COUNT) continue;
-        const int bit = p - NOTE_BASE;
-        const int v   = std::clamp(static_cast<int>(ev.amplitude * 127.0), 1, 127);
-        if (!(newBits & (1ULL << bit)) || v > newVel[bit]) {
-            newBits      |= (1ULL << bit);
-            newVel[bit]   = static_cast<int8_t>(v);
-        }
-    }
-
-    // CNN did not confirm provisional — blacklist it for next onset (one-onset suppression).
-    if (prov != -1 && !bmTest(newBits, prov))
-        r.obdBlacklistNote.store(prov, std::memory_order_release);
-
-    // If the provisional is already in the hold-countdown queue from a previous cycle,
-    // force-expire it now so the decrement loop below sends OFF this cycle.
-    if (prov != -1 && prov >= NOTE_BASE && prov < NOTE_BASE + NOTE_COUNT
-        && !bmTest(newBits, prov)) {
-        const int provBit = prov - NOTE_BASE;
-        if (r.holdNotes & (1ULL << provBit))
-            r.holdCounts[provBit] = 1;  // decrement to 0 below → OFF this cycle
-    }
-
-    // Note-ONs: cancel any hold for returning notes, then fire
-    const uint64_t returning = newBits & r.holdNotes;
-    for (uint64_t tmp = returning; tmp; tmp &= tmp - 1) {
-        const int bit = __builtin_ctzll(tmp);
-        r.holdCounts[bit] = 0;
-    }
-    r.holdNotes &= ~returning;
-    for (uint64_t tmp = newBits & ~r.activeNotes; tmp; tmp &= tmp - 1) {
-        const int bit = __builtin_ctzll(tmp);
-        r.midiOut.push({true,  static_cast<uint8_t>(NOTE_BASE + bit), static_cast<uint8_t>(newVel[bit])});
-        r.activeNotes |= (1ULL << bit);
-    }
-
-    // Decrement holds; OFF expired
-    for (uint64_t tmp = r.holdNotes; tmp; tmp &= tmp - 1) {
-        const int bit = __builtin_ctzll(tmp);
-        if (--r.holdCounts[bit] <= 0) {
-            r.midiOut.push({false, static_cast<uint8_t>(NOTE_BASE + bit), 0});
-            r.activeNotes &= ~(1ULL << bit);
-            r.holdNotes   &= ~(1ULL << bit);
-            r.holdCounts[bit] = 0;
-        }
-    }
-
-    // Active notes absent from newBits and not in hold → start hold or OFF
-    for (uint64_t tmp = r.activeNotes & ~newBits & ~r.holdNotes; tmp; tmp &= tmp - 1) {
-        const int bit = __builtin_ctzll(tmp);
-        // A cancelled/corrected OBP provisional was never CNN-confirmed — skip hold.
-        const bool cancelledProv = (prov != -1 && (NOTE_BASE + bit) == prov
-                                    && !bmTest(newBits, prov));
-        if (r.cfg.holdCycles > 0 && !cancelledProv) {
-            r.holdNotes      |= (1ULL << bit);
-            r.holdCounts[bit]  = static_cast<int8_t>(r.cfg.holdCycles);
-        } else {
-            r.midiOut.push({false, static_cast<uint8_t>(NOTE_BASE + bit), 0});
-            r.activeNotes &= ~(1ULL << bit);
-        }
-    }
-}
+// ── Worker thread ──────────────────────────────────────────────────────────────
 
 static void runWorker(NeuralNotePlugin* self)
 {
@@ -274,7 +167,7 @@ static void runWorker(NeuralNotePlugin* self)
         const float ampFloor = self->ampFloorVal.load(std::memory_order_relaxed);
 
         for (int ri = 0; ri < static_cast<int>(self->ranges.size()); ++ri) {
-            PerRangeState& r = *self->ranges[ri];
+            RangeState& r = *self->ranges[ri];
             const bool hasSnap    = r.snapChan.ready.load(std::memory_order_acquire);
             const bool paramsChgd = r.paramsChanged.exchange(false, std::memory_order_acq_rel);
 
@@ -306,16 +199,22 @@ static void runWorker(NeuralNotePlugin* self)
                         r.activeNotes |= (1ULL << (prov - NOTE_BASE));
                     } else {
                         // Out-of-bitmap provisional: send OFF immediately.
-                        r.midiOut.push({false, static_cast<uint8_t>(prov), 0});
+                        r.midiOut.push({false, prov, 0});
                     }
                 }
                 // Pass -1 for out-of-bitmap prov — already handled above
                 const int provForDiff = (prov >= NOTE_BASE && prov < NOTE_BASE + NOTE_COUNT)
                                         ? prov : -1;
-                applyRangeDiff(r, ampFloor, provForDiff);
+                uint64_t newBits = 0;
+                int8_t   newVel[NOTE_COUNT] = {};
+                buildNNBits(r, ampFloor, newBits, newVel);
+                applyNotesDiff(r, newBits, newVel, provForDiff);
             } else if (paramsChgd && hasPriorResult[ri] && self->singleRangeMode) {
                 r.basicPitch->updateMIDI();
-                applyRangeDiff(r, ampFloor);
+                uint64_t newBits = 0;
+                int8_t   newVel[NOTE_COUNT] = {};
+                buildNNBits(r, ampFloor, newBits, newVel);
+                applyNotesDiff(r, newBits, newVel, -1);
             }
         }
     }
@@ -323,7 +222,7 @@ static void runWorker(NeuralNotePlugin* self)
     // Shutdown: note-offs for all active notes across all ranges
     for (auto& rp : self->ranges) {
         for (uint64_t tmp = rp->activeNotes; tmp; tmp &= tmp - 1)
-            rp->midiOut.push({false, static_cast<uint8_t>(NOTE_BASE + __builtin_ctzll(tmp)), 0});
+            rp->midiOut.push({false, NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp)), 0});
         rp->activeNotes = 0;
         rp->holdNotes   = 0;
     }
@@ -340,7 +239,7 @@ static void writeMidi(LV2_Atom_Forge* forge, uint32_t frames,
     lv2_atom_forge_write(forge, msg, 3);
 }
 
-static void pushToRing(PerRangeState& r, double sampleRate,
+static void pushToRing(RangeState& r, double sampleRate,
                         const float* in, int inLen)
 {
     const int rs = r.ringSize;
@@ -404,7 +303,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
     RangeConfig rangeCfg = loadRangeConfig(cfgPath);
 
     auto makeRange = [&](const NoteRange& cfg) {
-        auto r             = std::make_unique<PerRangeState>();
+        auto r             = std::make_unique<RangeState>();
         r->cfg             = cfg;
         r->ringSize        = windowMsToRingSize(cfg.windowMs);
         r->minFreshSamples = std::max(r->ringSize / 2, MIN_FRESH_FLOOR);
@@ -489,7 +388,7 @@ static void activate(LV2_Handle instance)
         rp->snapChan.provNoteAtDispatch = -1;
         // Send note-offs for any active notes
         for (uint64_t tmp = rp->activeNotes; tmp; tmp &= tmp - 1)
-            rp->midiOut.push({false, static_cast<uint8_t>(NOTE_BASE + __builtin_ctzll(tmp)), 0});
+            rp->midiOut.push({false, NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp)), 0});
         rp->activeNotes = 0;
         rp->holdNotes   = 0;
         std::memset(rp->holdCounts, 0, NOTE_COUNT);
@@ -516,13 +415,13 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         while (rp->midiOut.pop(pn))
             writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
                       pn.noteOn ? uint8_t(0x90) : uint8_t(0x80),
-                      pn.pitch,
-                      pn.noteOn ? pn.velocity : uint8_t(0));
+                      static_cast<uint8_t>(pn.pitch),
+                      pn.noteOn ? static_cast<uint8_t>(pn.velocity) : uint8_t(0));
     }
 
     // Single-range mode: propagate LV2 port changes to worker atomics
     if (self->singleRangeMode) {
-        PerRangeState& r     = *self->ranges[0];
+        RangeState& r     = *self->ranges[0];
         bool           chgd  = false;
 
         if (self->threshold) {
@@ -563,7 +462,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 r.basicPitch->reset();
                 // Release note-offs directly into the output queue
                 for (uint64_t tmp = r.activeNotes; tmp; tmp &= tmp - 1)
-                    r.midiOut.push({false, static_cast<uint8_t>(NOTE_BASE + __builtin_ctzll(tmp)), 0});
+                    r.midiOut.push({false, NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp)), 0});
                 r.activeNotes = 0;
                 r.holdNotes   = 0;
             }
@@ -608,7 +507,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
 
     // Push audio into each range's ring; dispatch snapshot when ready — lockless
     for (auto& rp : self->ranges) {
-        PerRangeState& r = *rp;
+        RangeState& r = *rp;
 
         if (!gated) {
             pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));

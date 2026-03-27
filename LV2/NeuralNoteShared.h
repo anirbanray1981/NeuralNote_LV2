@@ -62,6 +62,36 @@ static constexpr float ONSET_BLANK_MS = 50.0f;  // re-trigger suppression window
 
 static constexpr int MIDI_QUEUE_CAP = 64; // events between audio callbacks; 64 is ample
 
+// ── Pending MIDI event ────────────────────────────────────────────────────────
+// velocity: 0–127.  LV2 consumer casts to uint8_t; synth consumer divides by 127.f.
+
+struct PendingNote { bool noteOn; int pitch; int velocity; };
+
+// ── Lockless SPSC MIDI output queue (worker → audio thread) ──────────────────
+// Standard single-producer / single-consumer ring buffer.
+// Producer: worker thread.  Consumer: audio/process callback.
+
+struct MidiOutQueue {
+    PendingNote      buf[MIDI_QUEUE_CAP];
+    std::atomic<int> head{0};
+    std::atomic<int> tail{0};
+
+    void push(PendingNote n) {
+        const int t    = tail.load(std::memory_order_relaxed);
+        const int next = (t + 1) % MIDI_QUEUE_CAP;
+        if (next == head.load(std::memory_order_acquire)) return; // drop if full
+        buf[t] = n;
+        tail.store(next, std::memory_order_release);
+    }
+    bool pop(PendingNote& out) {
+        const int h = head.load(std::memory_order_relaxed);
+        if (h == tail.load(std::memory_order_acquire)) return false;
+        out = buf[h];
+        head.store((h + 1) % MIDI_QUEUE_CAP, std::memory_order_release);
+        return true;
+    }
+};
+
 // ── Window helper ─────────────────────────────────────────────────────────────
 
 static inline int windowMsToRingSize(float ms)
@@ -101,15 +131,9 @@ struct SnapshotChannel {
 
 // ── Per-range state base ──────────────────────────────────────────────────────
 //
-// Contains all fields shared between PerRangeState (LV2 plugin) and
+// Contains all fields shared between RangeState (LV2 plugin) and
 // RangeState (JACK tuning tool).  Each file derives its own struct and adds
-// the file-specific extras (LV2 single-range params / tune hold/logging state)
-// plus a file-specific MidiOutQueue (which uses a different PendingNote type
-// in each target and therefore cannot live here).
-//
-// Field naming convention: use `basicPitch` and `ring` as the canonical names.
-// neuralnote_impl.cpp previously used `basicPitch`/`ringBuf`;
-// neuralnote_tune.cpp previously used `bp`/`ring`.  Both now use the base names.
+// file-specific extras (LV2 single-range params / tune hold/logging state).
 
 struct RangeStateBase {
     NoteRange cfg;
@@ -125,6 +149,7 @@ struct RangeStateBase {
     int minFreshSamples = 0;  // = max(ringSize/2, MIN_FRESH_FLOOR)
 
     SnapshotChannel snapChan;  // audio thread → worker (SPSC, lockless)
+    MidiOutQueue    midiOut;   // worker → audio thread (SPSC, lockless)
 
     // Note tracking (worker thread only — no synchronisation needed)
     // Bitmaps over E2 (MIDI 40) … E6 (MIDI 88) — 49 notes in a uint64_t.
@@ -340,4 +365,96 @@ static void dispatchSnapshotIfReady(
     r.snapChan.ready.store(true, std::memory_order_release);
     r.freshSamples = 0;
     sem_post(&workerSem);
+}
+
+// ── CNN output → note bitmap ──────────────────────────────────────────────────
+//
+// Iterates basicPitch::getNoteEvents(), filters by ampFloor and the range's
+// midiLow/midiHigh and bitmap bounds, and fills newBits/newVel.
+// Velocity values are 1–127 (int8_t); newVel is zeroed before filling.
+
+static void buildNNBits(RangeStateBase& r, float ampFloor,
+                        uint64_t& newBits, int8_t* newVel) noexcept
+{
+    newBits = 0;
+    std::memset(newVel, 0, NOTE_COUNT);
+    for (const auto& ev : r.basicPitch->getNoteEvents()) {
+        if (static_cast<float>(ev.amplitude) < ampFloor) continue;
+        const int p = static_cast<int>(ev.pitch);
+        if (p < r.cfg.midiLow || p > r.cfg.midiHigh) continue;
+        if (p < NOTE_BASE || p >= NOTE_BASE + NOTE_COUNT) continue;
+        const int bit = p - NOTE_BASE;
+        const int v   = std::clamp(static_cast<int>(ev.amplitude * 127.0), 1, 127);
+        if (!(newBits & (1ULL << bit)) || v > newVel[bit]) {
+            newBits    |= (1ULL << bit);
+            newVel[bit] = static_cast<int8_t>(v);
+        }
+    }
+}
+
+// ── Note ON/OFF/hold state machine ────────────────────────────────────────────
+//
+// Applies CNN result (newBits/newVel) to per-range note state and queues MIDI
+// events into r.midiOut.  prov is the OBP provisional MIDI note (-1 if none).
+//
+// Logic:
+//   • If prov wasn't confirmed → blacklist it (one-onset suppression).
+//   • If prov sits in the hold-countdown queue → force-expire it so OFF fires
+//     this cycle rather than waiting holdCycles more inferences.
+//   • Note-ONs: cancel any outstanding hold for returning notes, then push ON.
+//   • Hold decrement: tick all held notes; push OFF for those that expire.
+//   • Vanishing notes: start hold (unless cancelled prov) or push OFF directly.
+//
+// No logging — callers may compare activeNotes before/after if they need logs.
+
+static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
+                           const int8_t* newVel, int prov) noexcept
+{
+    // Blacklist unconfirmed provisional
+    if (prov != -1 && !bmTest(newBits, prov))
+        r.obdBlacklistNote.store(prov, std::memory_order_release);
+
+    // Force-expire cancelled prov from hold so OFF fires this cycle
+    if (prov != -1 && prov >= NOTE_BASE && prov < NOTE_BASE + NOTE_COUNT
+        && !bmTest(newBits, prov)) {
+        const int provBit = prov - NOTE_BASE;
+        if (r.holdNotes & (1ULL << provBit))
+            r.holdCounts[provBit] = 1;
+    }
+
+    // Note-ONs: cancel hold for returning notes, then fire
+    const uint64_t returning = newBits & r.holdNotes;
+    for (uint64_t tmp = returning; tmp; tmp &= tmp - 1)
+        r.holdCounts[__builtin_ctzll(tmp)] = 0;
+    r.holdNotes &= ~returning;
+    for (uint64_t tmp = newBits & ~r.activeNotes; tmp; tmp &= tmp - 1) {
+        const int bit = __builtin_ctzll(tmp);
+        r.midiOut.push({true, NOTE_BASE + bit, newVel[bit]});
+        r.activeNotes |= (1ULL << bit);
+    }
+
+    // Decrement holds; OFF expired
+    for (uint64_t tmp = r.holdNotes; tmp; tmp &= tmp - 1) {
+        const int bit = __builtin_ctzll(tmp);
+        if (--r.holdCounts[bit] <= 0) {
+            r.midiOut.push({false, NOTE_BASE + bit, 0});
+            r.activeNotes &= ~(1ULL << bit);
+            r.holdNotes   &= ~(1ULL << bit);
+            r.holdCounts[bit] = 0;
+        }
+    }
+
+    // Active notes absent from newBits → start hold or OFF immediately
+    for (uint64_t tmp = r.activeNotes & ~newBits & ~r.holdNotes; tmp; tmp &= tmp - 1) {
+        const int  bit          = __builtin_ctzll(tmp);
+        const bool cancelledProv = (prov != -1 && (NOTE_BASE + bit) == prov
+                                    && !bmTest(newBits, prov));
+        if (r.cfg.holdCycles > 0 && !cancelledProv) {
+            r.holdNotes      |= (1ULL << bit);
+            r.holdCounts[bit]  = static_cast<int8_t>(r.cfg.holdCycles);
+        } else {
+            r.midiOut.push({false, NOTE_BASE + bit, 0});
+            r.activeNotes &= ~(1ULL << bit);
+        }
+    }
 }

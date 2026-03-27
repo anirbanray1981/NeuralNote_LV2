@@ -460,15 +460,15 @@ static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
             r.holdCounts[provBit] = 1;
     }
 
-    // Returning notes (were in hold, now seen again by CNN) = new staccato hit.
-    // Send OFF+ON to retrigger the synth cleanly; leave activeNotes bit set.
+    // Returning notes (were in hold, now seen again by CNN).
+    // Just cancel the hold — the MIDI note is already playing (no OFF was sent when
+    // entering hold).  Do NOT send OFF+ON here: CNN confidence fluctuation on a
+    // sustained note would cause spurious stutters every time a cycle is missed.
+    // Same-note staccato re-hits are handled at the provisional level by fireProv
+    // reading activeNotesBits and sending OFF before ON.
     const uint64_t returning = newBits & r.holdNotes;
-    for (uint64_t tmp = returning; tmp; tmp &= tmp - 1) {
-        const int bit = __builtin_ctzll(tmp);
-        r.holdCounts[bit] = 0;
-        r.midiOut.push({false, NOTE_BASE + bit, 0});
-        r.midiOut.push({true,  NOTE_BASE + bit, newVel[bit]});
-    }
+    for (uint64_t tmp = returning; tmp; tmp &= tmp - 1)
+        r.holdCounts[__builtin_ctzll(tmp)] = 0;
     r.holdNotes &= ~returning;
     // New note-ONs (not already active or returning)
     for (uint64_t tmp = newBits & ~r.activeNotes; tmp; tmp &= tmp - 1) {

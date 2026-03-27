@@ -52,6 +52,14 @@
 #include "NoteRangeConfig.h"
 #include "OneBitPitchDetector.h"
 
+// McLeod Pitch Method: only on ARMv8.2-A (Pi 5, Cortex-A76).
+// __ARM_FEATURE_DOTPROD is defined when compiling with -march=armv8.2-a+dotprod.
+// The neon (Pi 4) build omits MPM entirely — no FFTW dependency.
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+#  define NEURALNOTE_ENABLE_MPM 1
+#  include "McLeodPitchDetector.h"
+#endif
+
 #define PLUGIN_URI "https://github.com/DamRsn/NeuralNote/guitar2midi"
 
 #ifndef NEURALNOTE_IMPL_NAME
@@ -62,6 +70,14 @@
 #define NEURALNOTE_STRINGIFY(x)  NEURALNOTE_STRINGIFY2(x)
 
 // ── Constants ─────────────────────────────────────────────────────────────────
+
+// Guitar note bitmap: E2 (MIDI 40) … E6 (MIDI 88), 49 notes, fits in uint64_t.
+static constexpr int NOTE_BASE  = 40;
+static constexpr int NOTE_COUNT = 49;
+
+static inline void bmSet  (uint64_t& b, int midi) noexcept { b |=  (1ULL << (midi - NOTE_BASE)); }
+static inline void bmClear(uint64_t& b, int midi) noexcept { b &= ~(1ULL << (midi - NOTE_BASE)); }
+static inline bool bmTest (uint64_t  b, int midi) noexcept { return (b >> (midi - NOTE_BASE)) & 1; }
 
 static constexpr int RING_MAX = static_cast<int>(AUDIO_SAMPLE_RATE * 2.0); // 44100
 
@@ -198,19 +214,28 @@ struct PerRangeState {
     MidiOutQueue    midiOut;    // worker → run()
 
     // Note tracking (worker thread only — no synchronisation needed)
-    std::set<uint8_t>      activeSet;
-    std::map<uint8_t, int> noteHold;
+    // Note state — bus-aligned bitmaps over the guitar range E2–E6 (49 notes)
+    uint64_t activeNotes = 0;
+    uint64_t holdNotes   = 0;
+    alignas(8) int8_t holdCounts[NOTE_COUNT] = {};
 
     // Two-phase pitch detection: OneBitPitch fires a provisional note-ON
     // immediately; BasicPitch CNN confirms, corrects, or cancels it.
     OneBitPitchDetector obd;
     std::atomic<int>    provNote{-1};  // -1 = none; set by run(), cleared by worker
     OBPVotingBuffer     obdVoting;
+    std::atomic<int>    obdBlacklistNote{-1};  // note CNN cancelled; suppressed for next onset
+    // Bit-parallel HPS register: accumulates all OBP detections this onset window.
+    // Merged cross-range at voting time to identify the true fundamental.
+    uint64_t            obpHpsBits = 0;
     bool                obdOnsetActive  = false;
     int                 obdWindowRemain = 0;
 
-    // Per-range worker thread
-    std::thread workerThread;
+#ifdef NEURALNOTE_ENABLE_MPM
+    // McLeod Pitch Method: runs in parallel with OBP during the onset window.
+    // Provisional fires only if OBP + HPS + MPM all agree on the same note.
+    McLeodPitchDetector mpm;
+#endif
 
     // Single-range mode: run() writes these; worker reads them.
     // Ordering guaranteed by the semaphore post/wait on snapChan.
@@ -262,116 +287,151 @@ struct NeuralNotePlugin {
 
     // Onset detector state (run() thread only — no synchronisation needed)
     float onsetSmoothedRms = 0.001f;
-    int   onsetBlankRemain = 0;      // raw input samples remaining in blank period
+    int   onsetBlankRemain = 0;
+
+    // Single worker thread shared across all ranges
+    std::thread       workerThread;
+    std::atomic<bool> workerQuit{false};
+    sem_t             workerSem;
 };
 
 // ── Worker thread (one per range) ─────────────────────────────────────────────
 
-static void applyRangeDiff(PerRangeState& r, float ampFloor)
+static void applyRangeDiff(PerRangeState& r, float ampFloor, int prov = -1)
 {
-    std::set<uint8_t>          newSet;
-    std::map<uint8_t, uint8_t> velMap;
-
+    // Build CNN result as bitmap + velocity array
+    uint64_t newBits = 0;
+    int8_t   newVel[NOTE_COUNT] = {};
     for (const auto& ev : r.basicPitch->getNoteEvents()) {
         if (static_cast<float>(ev.amplitude) < ampFloor) continue;
         const int p = static_cast<int>(ev.pitch);
         if (p < r.cfg.midiLow || p > r.cfg.midiHigh) continue;
-        const auto pitch = static_cast<uint8_t>(std::clamp(p, 0, 127));
-        const auto vel   = static_cast<uint8_t>(
-            std::clamp(static_cast<int>(ev.amplitude * 127.0), 1, 127));
-        newSet.insert(pitch);
-        auto it = velMap.find(pitch);
-        if (it == velMap.end() || vel > it->second) velMap[pitch] = vel;
-    }
-
-    for (auto p : newSet) {
-        r.noteHold.erase(p);
-        if (!r.activeSet.count(p)) {
-            r.midiOut.push({true, p, velMap[p]});
-            r.activeSet.insert(p);
+        if (p < NOTE_BASE || p >= NOTE_BASE + NOTE_COUNT) continue;
+        const int bit = p - NOTE_BASE;
+        const int v   = std::clamp(static_cast<int>(ev.amplitude * 127.0), 1, 127);
+        if (!(newBits & (1ULL << bit)) || v > newVel[bit]) {
+            newBits      |= (1ULL << bit);
+            newVel[bit]   = static_cast<int8_t>(v);
         }
     }
 
-    for (auto it = r.noteHold.begin(); it != r.noteHold.end(); ) {
-        if (--(it->second) <= 0) {
-            r.midiOut.push({false, it->first, 0});
-            r.activeSet.erase(it->first);
-            it = r.noteHold.erase(it);
+    // CNN did not confirm provisional — blacklist it for next onset (one-onset suppression).
+    if (prov != -1 && !bmTest(newBits, prov))
+        r.obdBlacklistNote.store(prov, std::memory_order_release);
+
+    // If the provisional is already in the hold-countdown queue from a previous cycle,
+    // force-expire it now so the decrement loop below sends OFF this cycle.
+    if (prov != -1 && prov >= NOTE_BASE && prov < NOTE_BASE + NOTE_COUNT
+        && !bmTest(newBits, prov)) {
+        const int provBit = prov - NOTE_BASE;
+        if (r.holdNotes & (1ULL << provBit))
+            r.holdCounts[provBit] = 1;  // decrement to 0 below → OFF this cycle
+    }
+
+    // Note-ONs: cancel any hold for returning notes, then fire
+    const uint64_t returning = newBits & r.holdNotes;
+    for (uint64_t tmp = returning; tmp; tmp &= tmp - 1) {
+        const int bit = __builtin_ctzll(tmp);
+        r.holdCounts[bit] = 0;
+    }
+    r.holdNotes &= ~returning;
+    for (uint64_t tmp = newBits & ~r.activeNotes; tmp; tmp &= tmp - 1) {
+        const int bit = __builtin_ctzll(tmp);
+        r.midiOut.push({true,  static_cast<uint8_t>(NOTE_BASE + bit), static_cast<uint8_t>(newVel[bit])});
+        r.activeNotes |= (1ULL << bit);
+    }
+
+    // Decrement holds; OFF expired
+    for (uint64_t tmp = r.holdNotes; tmp; tmp &= tmp - 1) {
+        const int bit = __builtin_ctzll(tmp);
+        if (--r.holdCounts[bit] <= 0) {
+            r.midiOut.push({false, static_cast<uint8_t>(NOTE_BASE + bit), 0});
+            r.activeNotes &= ~(1ULL << bit);
+            r.holdNotes   &= ~(1ULL << bit);
+            r.holdCounts[bit] = 0;
+        }
+    }
+
+    // Active notes absent from newBits and not in hold → start hold or OFF
+    for (uint64_t tmp = r.activeNotes & ~newBits & ~r.holdNotes; tmp; tmp &= tmp - 1) {
+        const int bit = __builtin_ctzll(tmp);
+        // A cancelled/corrected OBP provisional was never CNN-confirmed — skip hold.
+        const bool cancelledProv = (prov != -1 && (NOTE_BASE + bit) == prov
+                                    && !bmTest(newBits, prov));
+        if (r.cfg.holdCycles > 0 && !cancelledProv) {
+            r.holdNotes      |= (1ULL << bit);
+            r.holdCounts[bit]  = static_cast<int8_t>(r.cfg.holdCycles);
         } else {
-            ++it;
+            r.midiOut.push({false, static_cast<uint8_t>(NOTE_BASE + bit), 0});
+            r.activeNotes &= ~(1ULL << bit);
         }
     }
-
-    std::vector<uint8_t> immediateOff;
-    for (auto p : r.activeSet) {
-        if (newSet.count(p) || r.noteHold.count(p)) continue;
-        if (r.cfg.holdCycles > 0) {
-            r.noteHold[p] = r.cfg.holdCycles;
-        } else {
-            r.midiOut.push({false, p, 0});
-            immediateOff.push_back(p);
-        }
-    }
-    for (auto p : immediateOff) r.activeSet.erase(p);
 }
 
-static void runWorkerForRange(NeuralNotePlugin* self, PerRangeState* r)
+static void runWorker(NeuralNotePlugin* self)
 {
-    bool hasPriorResult = false;
+    std::array<bool, 8> hasPriorResult = {};
 
     while (true) {
-        sem_wait(&r->snapChan.sem);
+        sem_wait(&self->workerSem);
+        if (self->workerQuit.load(std::memory_order_acquire)) break;
 
-        if (r->snapChan.quit.load(std::memory_order_acquire)) break;
+        const float ampFloor = self->ampFloorVal.load(std::memory_order_relaxed);
 
-        const float ampFloor     = self->ampFloorVal.load(std::memory_order_relaxed);
-        const bool  hasSnap      = r->snapChan.ready.load(std::memory_order_acquire);
-        const bool  paramsChgd   = r->paramsChanged.exchange(false, std::memory_order_acq_rel);
+        for (int ri = 0; ri < static_cast<int>(self->ranges.size()); ++ri) {
+            PerRangeState& r = *self->ranges[ri];
+            const bool hasSnap    = r.snapChan.ready.load(std::memory_order_acquire);
+            const bool paramsChgd = r.paramsChanged.exchange(false, std::memory_order_acq_rel);
 
-        // Apply latest parameters
-        if (self->singleRangeMode) {
-            const float ft       = r->frameThresholdVal.load(std::memory_order_relaxed);
-            const float os       = r->onsetSensitivity.load(std::memory_order_relaxed);
-            const float frames   = r->minNoteFramesVal.load(std::memory_order_relaxed);
-            const float minDurMs = frames * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
-            r->basicPitch->setParameters(1.0f - ft, os, minDurMs);
-        } else {
-            const float minDurMs = r->cfg.minNoteLength * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
-            r->basicPitch->setParameters(1.0f - r->cfg.frameThreshold,
-                                          r->cfg.threshold, minDurMs);
-        }
-
-        if (hasSnap) {
-            r->basicPitch->transcribeToMIDI(r->snapChan.data.data(),
-                                             r->snapChan.snapshotSize);
-            // Release the slot so run() can write the next snapshot
-            r->snapChan.ready.store(false, std::memory_order_release);
-            hasPriorResult = true;
-
-            // Two-phase: if a provisional OneBitPitch note was sent, insert it into
-            // activeSet before applyRangeDiff so the CNN result handles it cleanly:
-            //   CNN confirms  → note in both activeSet + newSet → no double note-ON
-            //   CNN corrects  → applyRangeDiff sends note-OFF + correct note-ON
-            //   CNN finds nil → applyRangeDiff sends note-OFF
-            const int prov = r->snapChan.provNoteAtDispatch;
-            if (prov != -1) {
-                r->activeSet.insert(static_cast<uint8_t>(prov));
-                r->snapChan.provNoteAtDispatch = -1;
-                r->provNote.store(-1, std::memory_order_release);
+            if (self->singleRangeMode) {
+                const float ft       = r.frameThresholdVal.load(std::memory_order_relaxed);
+                const float os       = r.onsetSensitivity.load(std::memory_order_relaxed);
+                const float frames   = r.minNoteFramesVal.load(std::memory_order_relaxed);
+                const float minDurMs = frames * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
+                r.basicPitch->setParameters(1.0f - ft, os, minDurMs);
+            } else {
+                const float minDurMs = r.cfg.minNoteLength * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
+                r.basicPitch->setParameters(1.0f - r.cfg.frameThreshold,
+                                             r.cfg.threshold, minDurMs);
             }
 
-            applyRangeDiff(*r, ampFloor);
-        } else if (paramsChgd && hasPriorResult && self->singleRangeMode) {
-            r->basicPitch->updateMIDI();   // fast re-evaluation, no CNN
-            applyRangeDiff(*r, ampFloor);
+            if (hasSnap) {
+                r.basicPitch->transcribeToMIDI(r.snapChan.data.data(),
+                                                r.snapChan.snapshotSize);
+                r.snapChan.ready.store(false, std::memory_order_release);
+                hasPriorResult[ri] = true;
+
+                // Two-phase: insert provisional before diff.
+                // Always clear so stale out-of-range values never repeat.
+                const int prov = r.snapChan.provNoteAtDispatch;
+                r.snapChan.provNoteAtDispatch = -1;
+                if (prov != -1) {
+                    r.provNote.store(-1, std::memory_order_release);
+                    if (prov >= NOTE_BASE && prov < NOTE_BASE + NOTE_COUNT) {
+                        r.activeNotes |= (1ULL << (prov - NOTE_BASE));
+                    } else {
+                        // Out-of-bitmap provisional: send OFF immediately.
+                        r.midiOut.push({false, static_cast<uint8_t>(prov), 0});
+                    }
+                }
+                // Pass -1 for out-of-bitmap prov — already handled above
+                const int provForDiff = (prov >= NOTE_BASE && prov < NOTE_BASE + NOTE_COUNT)
+                                        ? prov : -1;
+                applyRangeDiff(r, ampFloor, provForDiff);
+            } else if (paramsChgd && hasPriorResult[ri] && self->singleRangeMode) {
+                r.basicPitch->updateMIDI();
+                applyRangeDiff(r, ampFloor);
+            }
         }
     }
 
-    // Shutdown: push note-offs for all active notes
-    for (auto p : r->activeSet)
-        r->midiOut.push({false, p, 0});
-    r->activeSet.clear();
-    r->noteHold.clear();
+    // Shutdown: note-offs for all active notes across all ranges
+    for (auto& rp : self->ranges) {
+        for (uint64_t tmp = rp->activeNotes; tmp; tmp &= tmp - 1)
+            rp->midiOut.push({false, static_cast<uint8_t>(NOTE_BASE + __builtin_ctzll(tmp)), 0});
+        rp->activeNotes = 0;
+        rp->holdNotes   = 0;
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -457,6 +517,14 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
         r->basicPitch = std::make_unique<BasicPitch>();
         const float minDurMs = cfg.minNoteLength * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
         r->basicPitch->setParameters(1.0f - cfg.frameThreshold, cfg.threshold, minDurMs);
+        // Configure per-range OBP lowpass
+        const float sr     = static_cast<float>(rate);
+        const float cutoff = std::min(440.0f * std::pow(2.0f, (cfg.midiHigh - 69) / 12.0f) * 1.5f,
+                                      sr * 0.45f);
+        r->obd.setLowpass(cutoff, sr);
+#ifdef NEURALNOTE_ENABLE_MPM
+        r->mpm.init(sr, cfg.midiLow, cfg.midiHigh);
+#endif
         return r;
     };
 
@@ -480,12 +548,12 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
         self->ranges.push_back(std::move(r));
     }
 
-    for (auto& rp : self->ranges)
-        rp->workerThread = std::thread(runWorkerForRange, self, rp.get());
+    sem_init(&self->workerSem, 0, 0);
+    self->workerThread = std::thread(runWorker, self);
 
     lv2_log_note(&self->logger,
                  "NeuralNote Guitar2MIDI: %.0f Hz  [impl: " NEURALNOTE_IMPL_NAME
-                 "]  [ranges: %zu, lockless workers]\n", rate, self->ranges.size());
+                 "]  [ranges: %zu, single worker thread]\n", rate, self->ranges.size());
     return static_cast<LV2_Handle>(self);
 }
 
@@ -517,15 +585,19 @@ static void activate(LV2_Handle instance)
         rp->basicPitch->reset();
         rp->obd.reset();
         rp->obdVoting.reset();
+#ifdef NEURALNOTE_ENABLE_MPM
+        rp->mpm.reset();
+#endif
         rp->obdOnsetActive  = false;
         rp->obdWindowRemain = 0;
         rp->provNote.store(-1, std::memory_order_relaxed);
         rp->snapChan.provNoteAtDispatch = -1;
         // Send note-offs for any active notes
-        for (auto p : rp->activeSet)
-            rp->midiOut.push({false, p, 0});
-        rp->activeSet.clear();
-        rp->noteHold.clear();
+        for (uint64_t tmp = rp->activeNotes; tmp; tmp &= tmp - 1)
+            rp->midiOut.push({false, static_cast<uint8_t>(NOTE_BASE + __builtin_ctzll(tmp)), 0});
+        rp->activeNotes = 0;
+        rp->holdNotes   = 0;
+        std::memset(rp->holdCounts, 0, NOTE_COUNT);
         // Cancel any pending snapshot
         rp->snapChan.ready.store(false, std::memory_order_release);
     }
@@ -579,7 +651,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         }
         if (chgd) {
             r.paramsChanged.store(true, std::memory_order_release);
-            sem_post(&r.snapChan.sem);
+            sem_post(&self->workerSem);
         }
 
         // Window size change: reset ring + cancel pending snapshot
@@ -595,9 +667,10 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 std::fill(r.ringBuf.begin(), r.ringBuf.end(), 0.0f);
                 r.basicPitch->reset();
                 // Release note-offs directly into the output queue
-                for (auto p : r.activeSet)
-                    r.midiOut.push({false, p, 0});
-                r.activeSet.clear();
+                for (uint64_t tmp = r.activeNotes; tmp; tmp &= tmp - 1)
+                    r.midiOut.push({false, static_cast<uint8_t>(NOTE_BASE + __builtin_ctzll(tmp)), 0});
+                r.activeNotes = 0;
+                r.holdNotes   = 0;
             }
         }
     }
@@ -645,13 +718,17 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         if (!gated) {
             pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));
 
-            // Two-phase OneBitPitch: arm on onset, expire after 100 ms.
-            // Voting buffer requires 9/12 consistent readings before firing.
+            // Two-phase OneBitPitch + MPM: arm on onset, expire after 100 ms.
             if (onsetFired) {
+                r.obdBlacklistNote.store(-1, std::memory_order_relaxed);  // new onset: clear blacklist
+                r.obpHpsBits      = 0;
                 r.obdOnsetActive  = true;
                 r.obdWindowRemain = static_cast<int>(self->sampleRate * 0.1f);
                 r.obdVoting.reset();
                 r.obd.reset();
+#ifdef NEURALNOTE_ENABLE_MPM
+                r.mpm.reset();  // fresh accumulation window for the new onset
+#endif
             } else if (r.obdWindowRemain > 0) {
                 r.obdWindowRemain -= static_cast<int>(nSamples);
                 if (r.obdWindowRemain <= 0) {
@@ -659,37 +736,102 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                     r.obdOnsetActive  = false;
                 }
             }
-            if (r.obdOnsetActive && r.provNote.load(std::memory_order_relaxed) == -1) {
-                const int op = r.obd.process(self->audioIn, static_cast<int>(nSamples),
-                                              static_cast<float>(self->sampleRate));
-                const int voted = r.obdVoting.update(
-                    (op >= r.cfg.midiLow && op <= r.cfg.midiHigh) ? op : -1);
-                if (voted != -1) {
-                    // Suppress if another range already has a provisional that is
-                    // the fundamental of this note (voted - 12 or - 24).
-                    bool isHarmonic = false;
-                    for (const auto& other : self->ranges) {
-                        if (other.get() == &r) continue;
-                        const int op2 = other->provNote.load(std::memory_order_relaxed);
-                        if (op2 != -1) {
-                            const int diff = voted - op2;
-                            if (diff == 12 || diff == 24) { isHarmonic = true; break; }
+
+            if (r.obdOnsetActive) {
+#ifdef NEURALNOTE_ENABLE_MPM
+                // Push all native-SR samples into MPM before OBP sub-block loop
+                // so the full callback is in the buffer when OBP votes below.
+                r.mpm.push(self->audioIn, static_cast<int>(nSamples));
+#endif
+
+                if (r.provNote.load(std::memory_order_relaxed) == -1) {
+                    // Process in small sub-blocks and check the voting buffer after each.
+                    // Fires provisional mid-buffer the moment the threshold is reached.
+                    static constexpr int OBP_CHUNK    = 16;
+                    static constexpr int OBP_NOTE_CAP = 76;  // E5 — reject OBP above this
+                    const float* obpPtr = self->audioIn;
+                    int          obpRem = static_cast<int>(nSamples);
+                    while (r.obdOnsetActive && obpRem > 0) {
+                        const int chunk = std::min(obpRem, OBP_CHUNK);
+                        const int op = r.obd.process(obpPtr, chunk,
+                                                      static_cast<float>(self->sampleRate));
+
+                        // Accumulate all in-bitmap detections for the HPS register.
+                        if (op >= NOTE_BASE && op < NOTE_BASE + NOTE_COUNT)
+                            r.obpHpsBits |= (1ULL << (op - NOTE_BASE));
+
+                        const int voted = r.obdVoting.update(
+                            (op >= r.cfg.midiLow && op <= r.cfg.midiHigh
+                             && op <= OBP_NOTE_CAP) ? op : -1);
+                        if (voted != -1) {
+                            // ── Layer 1: Cross-range harmonic suppression ─────────────
+                            bool isHarmonic = false;
+                            for (const auto& other : self->ranges) {
+                                if (other.get() == &r) continue;
+                                const int op2 = other->provNote.load(std::memory_order_relaxed);
+                                if (op2 != -1) {
+                                    const int diff = voted - op2;
+                                    if (diff == 12 || diff == 24) { isHarmonic = true; break; }
+                                }
+                            }
+
+                            // ── Layer 2: Bit-parallel HPS ────────────────────────────
+                            uint64_t allHps = 0;
+                            for (const auto& other : self->ranges) allHps |= other->obpHpsBits;
+                            const uint64_t hps2    = allHps & (allHps >> 12);
+                            const uint64_t hps3    = hps2   & (allHps >> 19);
+                            const uint64_t hpsBest = hps3 ? hps3 : hps2;
+                            int finalNote = voted;
+                            if (hpsBest) {
+                                const int hpsBit  = __builtin_ctzll(hpsBest);
+                                const int hpsNote = NOTE_BASE + hpsBit;
+                                if (hpsNote >= r.cfg.midiLow && hpsNote <= r.cfg.midiHigh)
+                                    finalNote = hpsNote;    // corrected to lower fundamental
+                                else if (hpsNote < r.cfg.midiLow)
+                                    isHarmonic = true;      // fundamental in lower range → suppress
+                            }
+
+                            r.obdOnsetActive  = false;
+                            r.obdWindowRemain = 0;
+                            r.obdVoting.reset();
+
+                            if (!isHarmonic) {
+                                const int bl = r.obdBlacklistNote.load(std::memory_order_relaxed);
+                                if (finalNote != bl) {
+#ifdef NEURALNOTE_ENABLE_MPM
+                                    // ── Layer 3: MPM consensus check (Pi 5 only) ──────────
+                                    // Provisional fires only if OBP + HPS + MPM all agree.
+                                    const int mpmNote = r.mpm.analyze(
+                                        static_cast<float>(self->sampleRate),
+                                        r.cfg.midiLow, r.cfg.midiHigh);
+                                    if (mpmNote != -1 && mpmNote == finalNote) {
+                                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                                  0x90, static_cast<uint8_t>(finalNote), uint8_t(100));
+                                        r.provNote.store(finalNote, std::memory_order_release);
+                                    }
+                                    // Silent suppression on disagreement
+#else
+                                    // Pi 4: OBP + HPS only — no MPM available
+                                    writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                              0x90, static_cast<uint8_t>(finalNote), uint8_t(100));
+                                    r.provNote.store(finalNote, std::memory_order_release);
+#endif
+                                }
+                            }
                         }
-                    }
-                    r.obdOnsetActive  = false;
-                    r.obdWindowRemain = 0;
-                    r.obdVoting.reset();
-                    if (!isHarmonic) {
-                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                                  0x90, static_cast<uint8_t>(voted), uint8_t(100));
-                        r.provNote.store(voted, std::memory_order_release);
+                        obpPtr += chunk;
+                        obpRem -= chunk;
                     }
                 }
             }
         } else {
-            // Silence: reset OBP state so stale periods don't persist into next note
+            // Silence: reset OBP + MPM state so stale data doesn't persist into next note
             r.obd.reset();
             r.obdVoting.reset();
+#ifdef NEURALNOTE_ENABLE_MPM
+            r.mpm.reset();
+#endif
+            r.obpHpsBits      = 0;
             r.obdOnsetActive  = false;
             r.obdWindowRemain = 0;
             int rem = static_cast<int>(nSamples);
@@ -713,7 +855,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             r.snapChan.provNoteAtDispatch = r.provNote.load(std::memory_order_relaxed);
             r.snapChan.ready.store(true, std::memory_order_release);
             r.freshSamples = 0;
-            sem_post(&r.snapChan.sem);
+            sem_post(&self->workerSem);
         }
     }
 
@@ -725,13 +867,11 @@ static void deactivate(LV2_Handle /*instance*/) {}
 static void cleanup(LV2_Handle instance)
 {
     NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
-    for (auto& rp : self->ranges) {
-        rp->snapChan.quit.store(true, std::memory_order_release);
-        sem_post(&rp->snapChan.sem);
-    }
-    for (auto& rp : self->ranges)
-        if (rp->workerThread.joinable())
-            rp->workerThread.join();
+    self->workerQuit.store(true, std::memory_order_release);
+    sem_post(&self->workerSem);
+    if (self->workerThread.joinable())
+        self->workerThread.join();
+    sem_destroy(&self->workerSem);
     delete self;
 }
 

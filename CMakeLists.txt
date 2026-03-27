@@ -389,10 +389,12 @@ if(BUILD_LV2)
             SAVE_DOWNSAMPLED_AUDIO=0
             USE_TEST_NOTE_FRAME_TO_TIME=0
         )
+        find_library(FFTW3F_LIB fftw3f)
         target_link_libraries(neuralnote_tune PRIVATE
             RTNeural
             ${LV2_ONNXRUNTIME_LIB}
             ${JACK_LIB}
+            $<$<BOOL:${FFTW3F_LIB}>:${FFTW3F_LIB}>
             pthread dl
         )
         message(STATUS "LV2: neuralnote_tune target enabled")

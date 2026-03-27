@@ -16,9 +16,8 @@
  *
  * Usage:
  *   neuralnote_tune [--bundle PATH] [--config PATH]
- *                   [--threshold 0.6] [--frame-threshold 0.5]
- *                   [--min-note-length 6] [--hold-cycles 2]
- *                   [--gate 0.003] [--amp-floor 0.65] [--window 150]
+ *                   [--threshold 0.6] [--frame-threshold 0.5] [--mode poly|mono]
+ *                   [--hold-cycles 2] [--gate 0.003] [--amp-floor 0.65] [--window 150]
  *                   [--waveform sine|saw|square]
  *                   [--attack MS] [--release MS] [--volume 0.3]
  *
@@ -120,9 +119,12 @@ struct RangeState : RangeStateBase {
 // ── Shared state ───────────────────────────────────────────────────────────────
 
 struct Monitor {
-    double sampleRate = 48000.0;
-    float  gateFloor  = 0.003f;
-    float  ampFloor   = 0.65f;
+    double   sampleRate     = 48000.0;
+    float    gateFloor      = 0.003f;
+    float    ampFloor       = 0.65f;
+    float    threshold      = 0.6f;
+    float    frameThreshold = 0.5f;
+    PlayMode mode           = PlayMode::POLY;
 
     std::vector<std::unique_ptr<RangeState>> ranges;
 
@@ -162,7 +164,7 @@ static void onSignal(int) { g_quit.store(true); }
 // machine to the shared applyNotesDiff helper.
 static void applyRangeDiff(Monitor* m, RangeState& r,
                            uint64_t newBits, const int8_t* newVel,
-                           double inferMs, int prov)
+                           double inferMs, int prov, bool mono)
 {
     const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - m->startTime).count();
@@ -194,7 +196,7 @@ static void applyRangeDiff(Monitor* m, RangeState& r,
     const uint64_t preActive = r.activeNotes;
 
     // Shared note ON/OFF/hold state machine (blacklist, force-expire, push events)
-    applyNotesDiff(r, newBits, newVel, prov);
+    applyNotesDiff(r, newBits, newVel, prov, mono);
 
     // Log note-ONs (notes that became active this cycle)
     for (uint64_t tmp = r.activeNotes & ~preActive; tmp; tmp &= tmp - 1) {
@@ -220,13 +222,15 @@ static void runWorker(Monitor* m)
         sem_wait(&m->workerSem);
         if (m->workerQuit.load(std::memory_order_acquire)) break;
 
-        for (auto& rp : m->ranges) {
-            RangeState& r = *rp;
+        const bool mono = (m->mode == PlayMode::MONO);
+
+        for (int ri = 0; ri < static_cast<int>(m->ranges.size()); ++ri) {
+            RangeState& r = *m->ranges[ri];
             if (!r.snapChan.ready.load(std::memory_order_acquire)) continue;
 
             const float minDurMs = r.cfg.minNoteLength * FFT_HOP
                                    / static_cast<float>(PLUGIN_SR) * 1000.0f;
-            r.basicPitch->setParameters(1.0f - r.cfg.frameThreshold, r.cfg.threshold, minDurMs);
+            r.basicPitch->setParameters(1.0f - m->frameThreshold, m->threshold, minDurMs);
 
             const auto t0 = std::chrono::steady_clock::now();
             r.basicPitch->transcribeToMIDI(r.snapChan.data.data(), r.snapChan.snapshotSize);
@@ -235,27 +239,53 @@ static void runWorker(Monitor* m)
                 std::chrono::steady_clock::now() - t0).count();
 
             // Two-phase: insert provisional into activeNotes before diff.
-            // Always clear provNoteAtDispatch/provNote so stale values never repeat.
-            // Two-phase: insert provisional into activeNotes before diff.
-            // Always clear so stale out-of-range values never repeat.
+            // Staleness check: if a new provisional has fired since this snapshot
+            // was dispatched, don't cancel it — the CNN result doesn't correspond
+            // to the current provisional.
             const int snapProv = r.snapChan.provNoteAtDispatch;
             r.snapChan.provNoteAtDispatch = -1;
-            if (snapProv != -1) {
-                r.provNote.store(-1, std::memory_order_release);
-                if (snapProv >= NOTE_BASE && snapProv < NOTE_BASE + NOTE_COUNT) {
-                    r.activeNotes |= (1ULL << (snapProv - NOTE_BASE));
-                } else {
-                    // Out-of-bitmap provisional: CNN can never track it, send OFF now.
-                    r.midiOut.push({false, snapProv, 0});
-                }
-            }
-            const int provForDiff = (snapProv >= NOTE_BASE && snapProv < NOTE_BASE + NOTE_COUNT)
-                                    ? snapProv : -1;
 
+            int provForDiff = -1;
+            if (snapProv != -1) {
+                const int currentProv = r.provNote.load(std::memory_order_acquire);
+                if (currentProv == snapProv) {
+                    r.provNote.store(-1, std::memory_order_release);
+                    if (snapProv >= NOTE_BASE && snapProv < NOTE_BASE + NOTE_COUNT) {
+                        r.activeNotes |= (1ULL << (snapProv - NOTE_BASE));
+                        provForDiff = snapProv;
+                    } else {
+                        r.midiOut.push({false, snapProv, 0});
+                    }
+                }
+                // If stale: leave provNote intact; provForDiff stays -1.
+            }
+
+            const uint64_t prevActive = r.activeNotes;
             uint64_t newBits = 0;
             int8_t   newVel[NOTE_COUNT] = {};
             buildNNBits(r, m->ampFloor, newBits, newVel);
-            applyRangeDiff(m, r, newBits, newVel, inferMs, provForDiff);
+            applyRangeDiff(m, r, newBits, newVel, inferMs, provForDiff, mono);
+
+            // Mono cross-range: new note-ON(s) in this range → kill all other ranges
+            if (mono && (r.activeNotes & ~prevActive)) {
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - m->startTime).count();
+                for (int oi = 0; oi < static_cast<int>(m->ranges.size()); ++oi) {
+                    if (oi == ri) continue;
+                    RangeState& other = *m->ranges[oi];
+                    for (uint64_t tmp = other.activeNotes; tmp; tmp &= tmp - 1) {
+                        const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
+                        std::printf("[+%.3fs]  OFF  %-4s (%3d)  [mono kill  range %s]\n",
+                                    elapsed, midiToName(p).c_str(), p, other.cfg.name.c_str());
+                        other.midiOut.push({false, p, 0});
+                    }
+                    other.activeNotes = 0;
+                    other.holdNotes   = 0;
+                    std::memset(other.holdCounts, 0, NOTE_COUNT);
+                    other.monoHeldNote.store(-1, std::memory_order_release);
+                }
+                std::fflush(stdout);
+            }
         }
     }
 
@@ -326,6 +356,14 @@ static void processSynth(Monitor* m, float* out, int nFrames)
         }
 
         rp.provOnTimeMs = elapsed * 1000.0;  // ms since startTime
+
+        // Mono: release all currently playing voices before firing new note
+        if (m->mode == PlayMode::MONO) {
+            for (auto& v : m->voices)
+                if (v.state != 0 && v.state != 3)
+                    v.state = 3;  // enter release
+        }
+
         std::printf("[+%.3fs]  ON   %-4s (%3d)  vel 100"
                     "  [1-bit provisional  range %s]\n",
                     elapsed, midiToName(pp).c_str(), pp, rp.cfg.name.c_str());
@@ -435,29 +473,47 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                                                 static_cast<int>(nFrames),
                                                 static_cast<float>(m->sampleRate),
                                                 m->ranges);
+                if (finalNote == -1 && !r.obdOnsetActive) {
+                    // OBP window just expired without a vote
+                    const double elapsed = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - m->startTime).count();
+                    std::printf("[+%.3fs]  --   OBP window expired  no vote  [range %s]\n",
+                                elapsed, r.cfg.name.c_str());
+                    std::fflush(stdout);
+                }
                 if (finalNote != -1) {
-                    // Layer 3: MPM consensus check — log outcome, fire only if all agree.
+                    // Layer 3: MPM consensus check — always log outcome.
                     const float  sr      = static_cast<float>(m->sampleRate);
                     const int    mpmNote = r.mpm.analyze(sr, r.cfg.midiLow, r.cfg.midiHigh);
+                    const int    mpmFill = r.mpm.circFill;
                     const double elapsed = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - m->startTime).count();
                     if (mpmNote == -1) {
-                        std::printf("[+%.3fs]  --   MPM not ready"
+                        std::printf("[+%.3fs]  --   MPM not ready (fill %d/%d)"
                                     "  OBP→%-4s(%d)  suppressed  [range %s]\n",
-                                    elapsed, midiToName(finalNote).c_str(), finalNote,
+                                    elapsed, mpmFill, McLeodPitchDetector::MPM_BUFSIZE,
+                                    midiToName(finalNote).c_str(), finalNote,
                                     r.cfg.name.c_str());
                         std::fflush(stdout);
                     } else if (mpmNote != finalNote) {
-                        std::printf("[+%.3fs]  --   MPM disagrees:"
+                        std::printf("[+%.3fs]  --   MPM disagrees (fill %d):"
                                     "  OBP→%-4s(%d)  MPM→%-4s(%d)  suppressed  [range %s]\n",
-                                    elapsed, midiToName(finalNote).c_str(), finalNote,
+                                    elapsed, mpmFill,
+                                    midiToName(finalNote).c_str(), finalNote,
                                     midiToName(mpmNote).c_str(), mpmNote,
                                     r.cfg.name.c_str());
                         std::fflush(stdout);
                     } else {
                         // All three agree — fire provisional
+                        std::printf("[+%.3fs]  --   OBP+MPM agree (fill %d): %-4s(%d)"
+                                    "  prov fired  [range %s]\n",
+                                    elapsed, mpmFill,
+                                    midiToName(finalNote).c_str(), finalNote,
+                                    r.cfg.name.c_str());
+                        std::fflush(stdout);
                         r.provMidiPitch = finalNote;
                         r.provNote.store(finalNote, std::memory_order_release);
+                        r.monoHeldNote.store(finalNote, std::memory_order_release);
                     }
                 }
             }
@@ -478,13 +534,14 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
 int main(int argc, char** argv)
 {
     std::string bundlePath, configPath;
-    float    threshold      = 0.6f;
-    float    frameThreshold = 0.5f;
-    int      minNoteLength  = 6;
-    float    gateFloor      = 0.003f;
+    float    threshold      = -1.0f;  // -1 = not set on CLI, use conf/default
+    float    frameThreshold = -1.0f;
+    float    gateFloor      = -1.0f;
+    float    ampFloor       = -1.0f;
     int      holdCyclesLow  = 2;
-    float    ampFloor       = 0.65f;
     float    windowMs       = 150.0f;
+    PlayMode mode           = PlayMode::POLY;
+    bool     modeSet        = false;
     Waveform waveform       = Waveform::SINE;
     float    attackMs       = 10.0f;
     float    releaseMs      = 400.0f;
@@ -495,11 +552,15 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--config")          && i+1 < argc) configPath     = argv[++i];
         else if (!std::strcmp(argv[i], "--threshold")       && i+1 < argc) threshold      = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--frame-threshold") && i+1 < argc) frameThreshold = std::stof(argv[++i]);
-        else if (!std::strcmp(argv[i], "--min-note-length") && i+1 < argc) minNoteLength  = std::stoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--hold-cycles")     && i+1 < argc) holdCyclesLow  = std::stoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--gate")            && i+1 < argc) gateFloor      = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--amp-floor")       && i+1 < argc) ampFloor       = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--window")          && i+1 < argc) windowMs       = std::stof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--mode")            && i+1 < argc) {
+            const char* s = argv[++i];
+            mode    = (!std::strcmp(s, "mono")) ? PlayMode::MONO : PlayMode::POLY;
+            modeSet = true;
+        }
         else if (!std::strcmp(argv[i], "--attack")          && i+1 < argc) attackMs       = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--release")         && i+1 < argc) releaseMs      = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--volume")          && i+1 < argc) masterVol      = std::stof(argv[++i]);
@@ -511,7 +572,7 @@ int main(int argc, char** argv)
         } else {
             std::fprintf(stderr,
                 "Usage: %s [--bundle PATH] [--config PATH]\n"
-                "          [--threshold F] [--frame-threshold F] [--min-note-length N]\n"
+                "          [--threshold F] [--frame-threshold F] [--mode mono|poly]\n"
                 "          [--hold-cycles N] [--gate F] [--amp-floor F] [--window MS]\n"
                 "          [--waveform sine|saw|square] [--attack MS] [--release MS] [--volume F]\n",
                 argv[0]);
@@ -555,42 +616,43 @@ int main(int argc, char** argv)
         rangeCfg = loadRangeConfig(configPath);
         if (rangeCfg.ranges.empty())
             std::fprintf(stderr, "Warning: config '%s' has no [range] sections.\n", configPath.c_str());
-        rangeCfg.gateFloor = gateFloor;
-        rangeCfg.ampFloor  = ampFloor;
     }
+
+    // CLI overrides (only when explicitly provided)
+    if (gateFloor      >= 0.0f)  rangeCfg.gateFloor      = gateFloor;
+    if (ampFloor       >= 0.0f)  rangeCfg.ampFloor        = ampFloor;
+    if (threshold      >= 0.0f)  rangeCfg.threshold       = threshold;
+    if (frameThreshold >= 0.0f)  rangeCfg.frameThreshold  = frameThreshold;
+    if (modeSet)                 rangeCfg.mode             = mode;
 
     if (rangeCfg.ranges.empty()) {
         NoteRange low;
-        low.name = "low";   low.midiLow = 0;   low.midiHigh = 48;
-        low.windowMs = windowMs; low.threshold = threshold;
-        low.frameThreshold = frameThreshold; low.minNoteLength = minNoteLength;
-        low.holdCycles = holdCyclesLow;
+        low.name = "low";  low.midiLow = 0;   low.midiHigh = 48;
+        low.windowMs = windowMs; low.holdCycles = holdCyclesLow;
         rangeCfg.ranges.push_back(low);
 
         NoteRange high;
         high.name = "high"; high.midiLow = 49; high.midiHigh = 127;
-        high.windowMs = windowMs; high.threshold = threshold;
-        high.frameThreshold = frameThreshold; high.minNoteLength = minNoteLength;
-        high.holdCycles = 0;
+        high.windowMs = windowMs; high.holdCycles = 0;
         rangeCfg.ranges.push_back(high);
-
-        rangeCfg.gateFloor = gateFloor;
-        rangeCfg.ampFloor  = ampFloor;
     }
 
     std::printf("Bundle:     %s\n", bundlePath.c_str());
     if (!configPath.empty()) std::printf("Config:     %s\n", configPath.c_str());
     std::printf("Gate:       %.4f%s\n", rangeCfg.gateFloor, rangeCfg.gateFloor == 0.0f ? " [disabled]" : "");
     std::printf("AmpFloor:   %.2f\n", rangeCfg.ampFloor);
+    std::printf("Threshold:  %.3f\n", rangeCfg.threshold);
+    std::printf("FrameThr:   %.3f\n", rangeCfg.frameThreshold);
+    std::printf("Mode:       %s\n", rangeCfg.mode == PlayMode::MONO ? "mono" : "poly");
     std::printf("Dispatch:   window/2 per range (onset overrides; floor %.0f ms)\n",
                 MIN_FRESH_FLOOR / static_cast<float>(PLUGIN_SR) * 1000.0f);
     std::printf("\nNote ranges (%zu, single worker thread):\n", rangeCfg.ranges.size());
-    std::printf("  %-12s  %4s  %4s  %6s  %5s  %5s  %3s  %s\n",
-                "Name","Low","High","WinMs","Thr","FrThr","MNL","Hold");
+    std::printf("  %-12s  %4s  %4s  %6s  %3s  %s\n",
+                "Name","Low","High","WinMs","MNL","Hold");
     for (const auto& r : rangeCfg.ranges)
-        std::printf("  %-12s  %4d  %4d  %6.0f  %.3f  %.3f  %3d  %d\n",
+        std::printf("  %-12s  %4d  %4d  %6.0f  %3d  %d\n",
                     r.name.c_str(), r.midiLow, r.midiHigh,
-                    r.windowMs, r.threshold, r.frameThreshold, r.minNoteLength, r.holdCycles);
+                    r.windowMs, r.minNoteLength, r.holdCycles);
     const char* wfName = waveform == Waveform::SAW ? "saw" : waveform == Waveform::SQUARE ? "square" : "sine";
     std::printf("\nWaveform:   %s  Attack: %.0f ms  Release: %.0f ms  Volume: %.2f\n\n",
                 wfName, attackMs, releaseMs, masterVol);
@@ -599,8 +661,11 @@ int main(int argc, char** argv)
     catch (const std::exception& e) { std::fprintf(stderr, "Failed to load models: %s\n", e.what()); return 1; }
 
     Monitor mon;
-    mon.gateFloor = rangeCfg.gateFloor;
-    mon.ampFloor  = rangeCfg.ampFloor;
+    mon.gateFloor      = rangeCfg.gateFloor;
+    mon.ampFloor       = rangeCfg.ampFloor;
+    mon.threshold      = rangeCfg.threshold;
+    mon.frameThreshold = rangeCfg.frameThreshold;
+    mon.mode           = rangeCfg.mode;
     mon.waveform  = waveform;
     mon.attackMs  = attackMs;
     mon.releaseMs = releaseMs;
@@ -626,14 +691,12 @@ int main(int argc, char** argv)
     mon.sampleRate = jack_get_sample_rate(client);
     std::printf("JACK:       %.0f Hz, buffer %u frames\n", mon.sampleRate, jack_get_buffer_size(client));
 
-    // Configure per-range OBP lowpass, MPM, and minimum-duration gate (all need sample rate).
+    // Configure per-range OBP lowpass and MPM (both need sample rate).
     for (auto& rp : mon.ranges) {
         const float sr     = static_cast<float>(mon.sampleRate);
         const float cutoff = std::min(midiToFreq(rp->cfg.midiHigh) * 1.5f, sr * 0.45f);
         rp->obd.setLowpass(cutoff, sr);
         rp->mpm.init(sr, rp->cfg.midiLow, rp->cfg.midiHigh);
-        rp->obdMinDurationSamples = static_cast<int>(
-            rp->cfg.minNoteLength * FFT_HOP / static_cast<float>(PLUGIN_SR) * mon.sampleRate);
     }
 
     mon.inPort  = jack_port_register(client, "audio_in",  JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput,  0);

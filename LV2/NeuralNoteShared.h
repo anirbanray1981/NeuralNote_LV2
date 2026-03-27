@@ -162,11 +162,10 @@ struct RangeStateBase {
     std::atomic<int>    provNote{-1};           // set by audio thread, cleared by worker
     OBPVotingBuffer     obdVoting;
     std::atomic<int>    obdBlacklistNote{-1};   // CNN-cancelled note; suppressed next onset
+    std::atomic<int>    monoHeldNote{-1};       // mono mode: current held note (-1 = none)
     uint64_t            obpHpsBits         = 0;    // HPS accumulator for this onset window
     bool                obdOnsetActive     = false;
     int                 obdWindowRemain    = 0;
-    int                 obdWindowElapsed   = 0;    // native-SR samples elapsed since onset arm
-    int                 obdMinDurationSamples = 0; // OBP cannot fire before this many samples
 
 #ifdef NEURALNOTE_ENABLE_MPM
     McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
@@ -210,18 +209,13 @@ static void armOrExpireOBP(RangeT& r, float sampleRate, int nSamples, bool onset
         r.obdBlacklistNote.store(-1, std::memory_order_relaxed);
         r.obpHpsBits         = 0;
         r.obdOnsetActive     = true;
-        r.obdWindowElapsed   = 0;
-        // Window = minDuration + 50 ms for OBP to vote; at least 100 ms.
-        r.obdWindowRemain    = std::max(static_cast<int>(sampleRate * 0.1f),
-                                        r.obdMinDurationSamples
-                                        + static_cast<int>(sampleRate * 0.05f));
+        r.obdWindowRemain    = static_cast<int>(sampleRate * 0.1f);  // 100 ms window
         r.obdVoting.reset();
         r.obd.reset();
 #ifdef NEURALNOTE_ENABLE_MPM
         r.mpm.reset();
 #endif
     } else if (r.obdWindowRemain > 0) {
-        r.obdWindowElapsed += nSamples;
         r.obdWindowRemain  -= nSamples;
         if (r.obdWindowRemain <= 0) {
             r.obdWindowRemain = 0;
@@ -246,7 +240,6 @@ static void resetOBPOnGate(RangeT& r) noexcept
     r.obpHpsBits       = 0;
     r.obdOnsetActive   = false;
     r.obdWindowRemain  = 0;
-    r.obdWindowElapsed = 0;
 }
 
 // ── OBP + HPS voting loop ─────────────────────────────────────────────────────
@@ -297,16 +290,6 @@ static int runOBPHPS(RangeT& r,
             (op >= r.cfg.midiLow && op <= r.cfg.midiHigh && op <= OBP_NOTE_CAP) ? op : -1);
 
         if (voted != -1) {
-            // ── minNoteLength gate ────────────────────────────────────────────
-            // If the note hasn't been held for minNoteLength yet, reset the
-            // voting buffer and keep listening rather than firing early.
-            if (r.obdWindowElapsed < r.obdMinDurationSamples) {
-                r.obdVoting.reset();
-                obpPtr += chunk;
-                obpRem -= chunk;
-                continue;
-            }
-
             // ── Layer 1: Cross-range harmonic suppression ─────────────────────
             bool isHarmonic = false;
             for (const auto& other : allRanges) {
@@ -426,8 +409,18 @@ static void buildNNBits(RangeStateBase& r, float ampFloor,
 // No logging — callers may compare activeNotes before/after if they need logs.
 
 static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
-                           const int8_t* newVel, int prov) noexcept
+                           const int8_t* newVel, int prov, bool mono = false) noexcept
 {
+    // Mono mode: reduce CNN result to single highest-velocity note in this range
+    if (mono && newBits) {
+        int8_t bestVel = 0; int bestBit = -1;
+        for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1) {
+            const int bit = __builtin_ctzll(tmp);
+            if (newVel[bit] > bestVel) { bestVel = newVel[bit]; bestBit = bit; }
+        }
+        newBits = (bestBit >= 0) ? (1ULL << bestBit) : 0;
+    }
+
     // Blacklist unconfirmed provisional
     if (prov != -1 && !bmTest(newBits, prov))
         r.obdBlacklistNote.store(prov, std::memory_order_release);
@@ -475,4 +468,10 @@ static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
             r.activeNotes &= ~(1ULL << bit);
         }
     }
+
+    // Mono: track current held note for cross-range provisional kill in audio thread
+    if (mono)
+        r.monoHeldNote.store(
+            r.activeNotes ? (NOTE_BASE + __builtin_ctzll(r.activeNotes)) : -1,
+            std::memory_order_release);
 }

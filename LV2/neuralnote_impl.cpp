@@ -51,6 +51,7 @@
 #include "BasicPitchConstants.h"
 #include "NoteRangeConfig.h"
 #include "OneBitPitchDetector.h"
+#include "NeuralNoteShared.h"
 
 // McLeod Pitch Method: only on ARMv8.2-A (Pi 5, Cortex-A76).
 // __ARM_FEATURE_DOTPROD is defined when compiling with -march=armv8.2-a+dotprod.
@@ -68,40 +69,6 @@
 
 #define NEURALNOTE_STRINGIFY2(x) #x
 #define NEURALNOTE_STRINGIFY(x)  NEURALNOTE_STRINGIFY2(x)
-
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-// Guitar note bitmap: E2 (MIDI 40) … E6 (MIDI 88), 49 notes, fits in uint64_t.
-static constexpr int NOTE_BASE  = 40;
-static constexpr int NOTE_COUNT = 49;
-
-static inline void bmSet  (uint64_t& b, int midi) noexcept { b |=  (1ULL << (midi - NOTE_BASE)); }
-static inline void bmClear(uint64_t& b, int midi) noexcept { b &= ~(1ULL << (midi - NOTE_BASE)); }
-static inline bool bmTest (uint64_t  b, int midi) noexcept { return (b >> (midi - NOTE_BASE)) & 1; }
-
-static constexpr int RING_MAX = static_cast<int>(AUDIO_SAMPLE_RATE * 2.0); // 44100
-
-// Absolute floor on fresh samples before a normal (non-onset) dispatch (~25 ms).
-// The per-range steady-state threshold is ringSize/2; this floor only applies to
-// very short windows so onset-triggered dispatches aren't immediately re-dispatched.
-static constexpr int MIN_FRESH_FLOOR = static_cast<int>(AUDIO_SAMPLE_RATE * 0.025f);
-
-// Onset detection: force-dispatch when a pick attack is detected.
-// onsetRatio: current block RMS must exceed the smoothed background by this factor.
-// onsetAlpha: background tracker time constant (~1/alpha blocks to settle).
-// onsetBlankMs: suppression window after a trigger to avoid re-firing on the same note.
-static constexpr float ONSET_RATIO    = 3.0f;
-static constexpr float ONSET_ALPHA    = 0.05f;
-static constexpr float ONSET_BLANK_MS = 50.0f;
-
-// MIDI output queue capacity per range (events between run() calls; 64 is ample).
-static constexpr int MIDI_QUEUE_CAP = 64;
-
-static inline int windowMsToRingSize(float ms)
-{
-    const float clamped = std::clamp(ms, 35.0f, 2000.0f);
-    return std::min(static_cast<int>(clamped / 1000.0f * AUDIO_SAMPLE_RATE), RING_MAX);
-}
 
 // ── Port indices ──────────────────────────────────────────────────────────────
 
@@ -137,32 +104,8 @@ static void mapURIs(LV2_URID_Map* map, URIs* uris)
 
 struct PendingNote { bool noteOn; uint8_t pitch; uint8_t velocity; };
 
-// ── Lockless SPSC snapshot channel (run() → worker) ──────────────────────────
-//
-// Ordering contract:
-//   Producer: write data/snapshotSize → ready.store(true, release) → sem_post
-//   Consumer: sem_wait → ready.load(acquire) → read data/snapshotSize → ready.store(false, release)
-//
-// The release/acquire on `ready` provides the happens-before edge; sem_post/wait
-// additionally ensures the worker sleeps when idle.
-
-struct SnapshotChannel {
-    std::vector<float> data;
-    int                snapshotSize       = 0;
-    int                provNoteAtDispatch = -1;  // set by run() at dispatch; read by worker
-    std::atomic<bool>  ready{false};
-    std::atomic<bool>  quit{false};
-    sem_t              sem;
-
-    SnapshotChannel()  { data.resize(RING_MAX); sem_init(&sem, 0, 0); }
-    ~SnapshotChannel() { sem_destroy(&sem); }
-    SnapshotChannel(const SnapshotChannel&)          = delete;
-    SnapshotChannel& operator=(const SnapshotChannel&) = delete;
-    SnapshotChannel(SnapshotChannel&&)               = delete;
-    SnapshotChannel& operator=(SnapshotChannel&&)    = delete;
-};
-
 // ── Lockless SPSC MIDI output queue (worker → run()) ─────────────────────────
+// (SnapshotChannel is defined in NeuralNoteShared.h)
 //
 // Standard single-producer / single-consumer ring buffer.
 // Producer: worker thread.  Consumer: run().

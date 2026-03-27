@@ -49,32 +49,11 @@
 #include "NoteRangeConfig.h"
 #include "OneBitPitchDetector.h"
 #include "McLeodPitchDetector.h"
+#include "NeuralNoteShared.h"
 
-// ── Constants ──────────────────────────────────────────────────────────────────
+// ── tune-only constants ────────────────────────────────────────────────────────
 
-// Guitar note bitmap: E2 (MIDI 40) … E6 (MIDI 88), 49 notes, fits in uint64_t.
-static constexpr int NOTE_BASE  = 40;
-static constexpr int NOTE_COUNT = 49;
-
-static inline void   bmSet  (uint64_t& b, int midi) noexcept { b |=  (1ULL << (midi - NOTE_BASE)); }
-static inline void   bmClear(uint64_t& b, int midi) noexcept { b &= ~(1ULL << (midi - NOTE_BASE)); }
-static inline bool   bmTest (uint64_t  b, int midi) noexcept { return (b >> (midi - NOTE_BASE)) & 1; }
-
-static constexpr double PLUGIN_SR        = 22050.0;
-static constexpr int    RING_MAX         = static_cast<int>(PLUGIN_SR * 2.0);
-static constexpr int    MAX_VOICES       = 16;
-static constexpr int    MIN_FRESH_FLOOR  = static_cast<int>(PLUGIN_SR * 0.025);
-static constexpr int    MIDI_QUEUE_CAP   = 64;
-
-static constexpr float  ONSET_RATIO    = 3.0f;
-static constexpr float  ONSET_ALPHA    = 0.05f;
-static constexpr float  ONSET_BLANK_MS = 50.0f;
-
-static int windowMsToRingSize(float ms)
-{
-    const float c = std::clamp(ms, 35.0f, 2000.0f);
-    return std::min(static_cast<int>(c / 1000.0f * PLUGIN_SR), RING_MAX);
-}
+static constexpr int MAX_VOICES = 16;
 
 // ── Note helpers ───────────────────────────────────────────────────────────────
 
@@ -130,26 +109,8 @@ struct SynthVoice {
 
 struct PendingNote { bool noteOn; int pitch; float velocity; };
 
-// ── Lockless SPSC snapshot channel (jackProcess → worker) ─────────────────────
-
-struct SnapshotChannel {
-    std::vector<float> data;
-    int                snapshotSize       = 0;
-    int                provNoteAtDispatch = -1;
-    double             provOnMs           = 0.0;  // ms since startTime when provisional fired
-    std::atomic<bool>  ready{false};
-    std::atomic<bool>  quit{false};
-    sem_t              sem;
-
-    SnapshotChannel()  { data.resize(RING_MAX); sem_init(&sem, 0, 0); }
-    ~SnapshotChannel() { sem_destroy(&sem); }
-    SnapshotChannel(const SnapshotChannel&)            = delete;
-    SnapshotChannel& operator=(const SnapshotChannel&) = delete;
-    SnapshotChannel(SnapshotChannel&&)                 = delete;
-    SnapshotChannel& operator=(SnapshotChannel&&)      = delete;
-};
-
 // ── Lockless SPSC MIDI output queue (worker → jackProcess) ────────────────────
+// (SnapshotChannel is defined in NeuralNoteShared.h)
 
 struct MidiOutQueue {
     PendingNote      buf[MIDI_QUEUE_CAP];

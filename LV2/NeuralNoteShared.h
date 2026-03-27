@@ -56,7 +56,7 @@ static constexpr int MIN_FRESH_FLOOR = static_cast<int>(PLUGIN_SR * 0.025); // ~
 
 static constexpr float ONSET_RATIO    = 3.0f;   // RMS must exceed background × this
 static constexpr float ONSET_ALPHA    = 0.05f;  // background tracker time constant
-static constexpr float ONSET_BLANK_MS = 50.0f;  // re-trigger suppression window
+static constexpr float ONSET_BLANK_MS = 25.0f;  // re-trigger suppression window
 
 // ── MIDI output queue ─────────────────────────────────────────────────────────
 
@@ -163,11 +163,18 @@ struct RangeStateBase {
     OBPVotingBuffer     obdVoting;
     std::atomic<int>    obdBlacklistNote{-1};   // CNN-cancelled note; suppressed next onset
     std::atomic<int>    monoHeldNote{-1};       // mono mode: current held note (-1 = none)
+    std::atomic<bool>     hasActiveNotes{false};   // worker has active/held notes; suppresses RMS gate
+    std::atomic<uint64_t> activeNotesBits{0};      // mirror of activeNotes bitmap; audio thread re-hit check
     uint64_t            obpHpsBits         = 0;    // HPS accumulator for this onset window
     bool                obdOnsetActive     = false;
     int                 obdWindowRemain    = 0;
     int                 obdPendingNote     = -1;   // OBP voted but MPM not ready; retry next callback
     int                 obdPendingRemain   = 0;    // sample countdown; clears pending when ≤ 0
+
+    // Worker-only: first CNN cycle after a new provisional fires may contain mostly
+    // the previous note's audio.  One grace cycle suppresses a premature cancel.
+    int                 provLastSeenByCNN  = -1;   // last provisional note the worker processed
+    int                 provCancelGrace    = 0;    // cancel-suppression cycles remaining
 
 #ifdef NEURALNOTE_ENABLE_MPM
     McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
@@ -353,12 +360,26 @@ static int runOBPHPS(RangeT& r,
 
 template<typename RangeT>
 static void dispatchSnapshotIfReady(
-    RangeT& r, bool onsetFired, double provOnMs, sem_t& workerSem)
+    RangeT& r, bool onsetFired, double provOnMs, sem_t& workerSem,
+    float gateFloor = 0.003f)
 {
     const int rs = r.ringSize;
     if (r.snapChan.ready.load(std::memory_order_acquire)) return;
     if (r.ringFilled < rs) return;
     if (!onsetFired && r.freshSamples < r.minFreshSamples) return;
+
+    // RMS gate: skip CNN dispatch if ring energy is negligible AND the worker
+    // has no active or held notes that still require note-off events.
+    // Catches sympathetic resonance / string buzz that slips past the onset
+    // detector but carries no real note energy.
+    // Bypassed when hasActiveNotes is true so decaying notes always get their
+    // CNN-driven hold countdown and eventual note-off.
+    if (!r.hasActiveNotes.load(std::memory_order_acquire)) {
+        const float* rd = r.ring.data();
+        float sumSq = 0.0f;
+        for (int i = 0; i < rs; ++i) sumSq += rd[i] * rd[i];
+        if (sumSq < gateFloor * gateFloor * static_cast<float>(rs)) return;
+    }
 
     const float* ringData = r.ring.data();
     const int    tail     = r.ringHead;
@@ -439,11 +460,17 @@ static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
             r.holdCounts[provBit] = 1;
     }
 
-    // Note-ONs: cancel hold for returning notes, then fire
+    // Returning notes (were in hold, now seen again by CNN).
+    // Just cancel the hold — the MIDI note is already playing (no OFF was sent when
+    // entering hold).  Do NOT send OFF+ON here: CNN confidence fluctuation on a
+    // sustained note would cause spurious stutters every time a cycle is missed.
+    // Same-note staccato re-hits are handled at the provisional level by fireProv
+    // reading activeNotesBits and sending OFF before ON.
     const uint64_t returning = newBits & r.holdNotes;
     for (uint64_t tmp = returning; tmp; tmp &= tmp - 1)
         r.holdCounts[__builtin_ctzll(tmp)] = 0;
     r.holdNotes &= ~returning;
+    // New note-ONs (not already active or returning)
     for (uint64_t tmp = newBits & ~r.activeNotes; tmp; tmp &= tmp - 1) {
         const int bit = __builtin_ctzll(tmp);
         r.midiOut.push({true, NOTE_BASE + bit, newVel[bit]});
@@ -480,4 +507,11 @@ static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
         r.monoHeldNote.store(
             r.activeNotes ? (NOTE_BASE + __builtin_ctzll(r.activeNotes)) : -1,
             std::memory_order_release);
+
+    // Publish note state to the audio thread:
+    //   hasActiveNotes — bypasses RMS gate so decaying notes still get note-offs.
+    //   activeNotesBits — allows fireProv to detect same-note re-hits and send OFF first.
+    r.hasActiveNotes.store(r.activeNotes != 0 || r.holdNotes != 0,
+                           std::memory_order_release);
+    r.activeNotesBits.store(r.activeNotes, std::memory_order_release);
 }

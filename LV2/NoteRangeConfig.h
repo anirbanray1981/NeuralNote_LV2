@@ -12,6 +12,7 @@
  *   threshold       = 0.6
  *   frame_threshold = 0.5
  *   mode            = poly    # or mono
+ *   onset_blank_ms  = 25      # re-trigger suppression window (ms)
  *
  *   [range]
  *   name            = E2-B2
@@ -54,7 +55,8 @@ struct RangeConfig {
     float     ampFloor       = 0.65f;
     float     threshold      = 0.6f;   // onset sensitivity (0.05–0.95)
     float     frameThreshold = 0.5f;   // frame confidence (0.05–0.95)
-    PlayMode  mode           = PlayMode::POLY;
+    float     onsetBlankMs   = 25.0f;  // re-trigger suppression window (ms)
+    PlayMode  mode           = PlayMode::MONO;
 };
 
 // Return the first range whose [midiLow, midiHigh] contains pitch, or nullptr.
@@ -106,6 +108,7 @@ static inline RangeConfig loadRangeConfig(const std::string& path)
         if (key == "amp_floor")       { cfg.ampFloor       = std::stof(val); continue; }
         if (key == "threshold")       { cfg.threshold      = std::stof(val); continue; }
         if (key == "frame_threshold") { cfg.frameThreshold = std::stof(val); continue; }
+        if (key == "onset_blank_ms") { cfg.onsetBlankMs = std::stof(val); continue; }
         if (key == "mode") {
             cfg.mode = (val == "mono") ? PlayMode::MONO : PlayMode::POLY;
             continue;

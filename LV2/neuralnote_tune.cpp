@@ -141,6 +141,7 @@ struct Monitor {
 
     // Onset detector state (jackProcess thread only)
     float onsetSmoothedRms = 0.001f;
+    float onsetBlankMs     = 25.0f;  // re-trigger suppression window (ms)
     int   onsetBlankRemain = 0;      // raw input samples remaining in blank period
 
     // Per-range OBP provisional note fired this onset (-1 if none); cleared on each onset.
@@ -364,6 +365,11 @@ static void processSynth(Monitor* m, float* out, int nFrames)
                     v.state = 3;  // enter release
         }
 
+        // Re-hit: release existing voice for this pitch so the synth retriggering cleanly.
+        for (auto& v : m->voices)
+            if (v.pitch == pp && v.state != 0 && v.state != 3)
+                v.state = 3;
+
         std::printf("[+%.3fs]  ON   %-4s (%3d)  vel 100"
                     "  [1-bit provisional  range %s]\n",
                     elapsed, midiToName(pp).c_str(), pp, rp.cfg.name.c_str());
@@ -441,7 +447,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         if (m->onsetBlankRemain < 0) m->onsetBlankRemain = 0;
     } else if (!gated && blockRms > m->onsetSmoothedRms * ONSET_RATIO) {
         onsetFired            = true;
-        m->onsetBlankRemain   = static_cast<int>(m->sampleRate * (ONSET_BLANK_MS / 1000.0f));
+        m->onsetBlankRemain   = static_cast<int>(m->sampleRate * (m->onsetBlankMs / 1000.0f));
         m->onsetSmoothedRms   = blockRms;
         m->onsetProvNotes.fill(-1);  // new onset: reset cross-range provisional tracking
     }
@@ -580,6 +586,7 @@ int main(int argc, char** argv)
     float    frameThreshold = -1.0f;
     float    gateFloor      = -1.0f;
     float    ampFloor       = -1.0f;
+    float    onsetBlankMs   = -1.0f;
     int      holdCyclesLow  = 2;
     float    windowMs       = 150.0f;
     PlayMode mode           = PlayMode::POLY;
@@ -597,6 +604,7 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--hold-cycles")     && i+1 < argc) holdCyclesLow  = std::stoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--gate")            && i+1 < argc) gateFloor      = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--amp-floor")       && i+1 < argc) ampFloor       = std::stof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--onset-blank")     && i+1 < argc) onsetBlankMs   = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--window")          && i+1 < argc) windowMs       = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--mode")            && i+1 < argc) {
             const char* s = argv[++i];
@@ -616,6 +624,7 @@ int main(int argc, char** argv)
                 "Usage: %s [--bundle PATH] [--config PATH]\n"
                 "          [--threshold F] [--frame-threshold F] [--mode mono|poly]\n"
                 "          [--hold-cycles N] [--gate F] [--amp-floor F] [--window MS]\n"
+                "          [--onset-blank MS]\n"
                 "          [--waveform sine|saw|square] [--attack MS] [--release MS] [--volume F]\n",
                 argv[0]);
             return 1;
@@ -665,6 +674,7 @@ int main(int argc, char** argv)
     if (ampFloor       >= 0.0f)  rangeCfg.ampFloor        = ampFloor;
     if (threshold      >= 0.0f)  rangeCfg.threshold       = threshold;
     if (frameThreshold >= 0.0f)  rangeCfg.frameThreshold  = frameThreshold;
+    if (onsetBlankMs   >= 0.0f)  rangeCfg.onsetBlankMs    = onsetBlankMs;
     if (modeSet)                 rangeCfg.mode             = mode;
 
     if (rangeCfg.ranges.empty()) {
@@ -686,6 +696,7 @@ int main(int argc, char** argv)
     std::printf("Threshold:  %.3f\n", rangeCfg.threshold);
     std::printf("FrameThr:   %.3f\n", rangeCfg.frameThreshold);
     std::printf("Mode:       %s\n", rangeCfg.mode == PlayMode::MONO ? "mono" : "poly");
+    std::printf("OnsetBlank: %.0f ms\n", rangeCfg.onsetBlankMs);
     std::printf("Dispatch:   window/2 per range (onset overrides; floor %.0f ms)\n",
                 MIN_FRESH_FLOOR / static_cast<float>(PLUGIN_SR) * 1000.0f);
     std::printf("\nNote ranges (%zu, single worker thread):\n", rangeCfg.ranges.size());
@@ -707,6 +718,7 @@ int main(int argc, char** argv)
     mon.ampFloor       = rangeCfg.ampFloor;
     mon.threshold      = rangeCfg.threshold;
     mon.frameThreshold = rangeCfg.frameThreshold;
+    mon.onsetBlankMs   = rangeCfg.onsetBlankMs;
     mon.mode           = rangeCfg.mode;
     mon.waveform  = waveform;
     mon.attackMs  = attackMs;

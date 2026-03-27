@@ -463,6 +463,15 @@ static void run(LV2_Handle instance, uint32_t nSamples)
 
             // Helper: fire a provisional note — shared by immediate and pending paths.
             auto fireProv = [&](int note) {
+                // Re-hit: if the note is already active (confirmed by the worker),
+                // send a note-OFF first so the downstream synth retriggering cleanly.
+                if (note >= NOTE_BASE && note < NOTE_BASE + NOTE_COUNT) {
+                    const uint64_t bits = r.activeNotesBits.load(std::memory_order_acquire);
+                    if (bits & (1ULL << (note - NOTE_BASE)))
+                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                  0x80, static_cast<uint8_t>(note), uint8_t(0));
+                }
+                // Mono: kill any other range's held note
                 if (self->modeVal.load(std::memory_order_relaxed) == 1) {
                     for (auto& other : self->ranges) {
                         const int held = other->monoHeldNote.load(std::memory_order_acquire);

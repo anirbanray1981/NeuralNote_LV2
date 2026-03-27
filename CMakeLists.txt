@@ -372,4 +372,57 @@ if(BUILD_LV2)
         )
         message(STATUS "LV2: neuralnote_tune target enabled")
     endif()
+
+    # ── Install targets ───────────────────────────────────────────────────────
+    set(LV2_INSTALL_PATH "/zynthian/zynthian-plugins/lv2"
+        CACHE STRING "Destination for the LV2 bundle (default: Zynthian LV2 path)")
+
+    # LV2 bundle
+    install(DIRECTORY "${LV2_BUNDLE_DIR}/"
+        DESTINATION "${LV2_INSTALL_PATH}/${LV2_BUNDLE_NAME}"
+        USE_SOURCE_PERMISSIONS
+    )
+
+    # MIDI fan-out script
+    install(PROGRAMS "${CMAKE_CURRENT_LIST_DIR}/LV2/neuralnote-connect.sh"
+        DESTINATION /usr/local/bin
+        RENAME neuralnote-connect.sh
+    )
+
+    # neuralnote_tune binary
+    if(BUILD_LV2_TUNE)
+        install(TARGETS neuralnote_tune
+            RUNTIME DESTINATION /usr/local/bin
+        )
+    endif()
+
+    # systemd service unit
+    install(FILES "${CMAKE_CURRENT_LIST_DIR}/LV2/neuralnote-connect.service"
+        DESTINATION /etc/systemd/system
+    )
+
+    # Post-install: reload systemd, enable service (if not already), restart Zynthian and service
+    install(CODE "
+        message(STATUS \"-- Running systemctl daemon-reload\")
+        execute_process(COMMAND systemctl daemon-reload)
+
+        execute_process(
+            COMMAND systemctl is-enabled neuralnote-connect.service
+            OUTPUT_VARIABLE _svc_enabled OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _svc_rc
+        )
+        if(NOT _svc_enabled STREQUAL \"enabled\")
+            message(STATUS \"-- Enabling neuralnote-connect.service\")
+            execute_process(COMMAND systemctl enable neuralnote-connect.service)
+        else()
+            message(STATUS \"-- neuralnote-connect.service already enabled\")
+        endif()
+
+        message(STATUS \"-- Restarting zynthian.service\")
+        execute_process(COMMAND systemctl restart zynthian.service)
+
+        message(STATUS \"-- Starting neuralnote-connect.service\")
+        execute_process(COMMAND systemctl restart neuralnote-connect.service)
+    ")
+
 endif()

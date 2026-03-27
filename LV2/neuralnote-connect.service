@@ -1,0 +1,14 @@
+[Unit]
+Description=NeuralNote MIDI fan-out — connect ZynMidiRouter:ch0_out to extra synth chains
+After=zynthian.service
+Requires=zynthian.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/neuralnote-connect.sh
+StandardOutput=journal
+StandardError=journal
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

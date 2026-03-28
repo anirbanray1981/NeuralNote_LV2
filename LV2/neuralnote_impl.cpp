@@ -688,8 +688,9 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                                   0x80, static_cast<uint8_t>(note), uint8_t(0));
                     } else if (bits != 0) {
                         // Transition: defer MIDI ON, store for SwiftF0 consensus.
-                        // Worker fires note-ON only if SwiftF0 agrees with this pitch.
+                        // Clear provNote so worker doesn't silently insert into activeNotes.
                         r.transitionProv.store(note, std::memory_order_release);
+                        r.provNote.store(-1, std::memory_order_release);
                         r.provCooldownRemain = static_cast<int>(self->sampleRate * 0.2);
                         r.provCooldownNote   = note;
                         return;

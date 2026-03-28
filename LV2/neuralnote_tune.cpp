@@ -529,7 +529,10 @@ static void processSynth(Monitor* m, float* out, int nFrames)
                         v.state = 3;
             } else if (bits != 0) {
                 // Transition: defer MIDI ON, store for SwiftF0 consensus.
+                // Clear provNote so worker doesn't silently insert the note
+                // into activeNotes without a MIDI ON.
                 rp.transitionProv.store(pp, std::memory_order_release);
+                rp.provNote.store(-1, std::memory_order_release);
                 rp.provCooldownRemain = static_cast<int>(m->sampleRate * 0.2);
                 rp.provCooldownNote   = pp;
                 continue;

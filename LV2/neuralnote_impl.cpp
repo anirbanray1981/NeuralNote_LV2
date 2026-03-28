@@ -677,6 +677,16 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 // Skip if same note is under cooldown (RMS re-trigger suppression)
                 if (r.provCooldownRemain > 0 && note == r.provCooldownNote)
                     return;
+                // High-note harmonic suppression: when a note >= E5 is active in
+                // another range, this provisional is likely a sympathetic harmonic.
+                if (self->modeVal.load(std::memory_order_relaxed) >= 1) {
+                    constexpr uint64_t highMask = ~((1ULL << (76 - NOTE_BASE)) - 1);
+                    for (auto& other : self->ranges) {
+                        if (&*other == &r) continue;
+                        if (other->activeNotesBits.load(std::memory_order_acquire) & highMask)
+                            return;
+                    }
+                }
                 // Same note already active: re-hit (OFF+ON) if PICK fired this
                 // callback (cooldown was just reset), else skip (RMS re-trigger).
                 if (note >= NOTE_BASE && note < NOTE_BASE + NOTE_COUNT) {

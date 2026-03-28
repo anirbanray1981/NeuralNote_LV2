@@ -542,6 +542,19 @@ static void processSynth(Monitor* m, float* out, int nFrames)
         // Skip if same note under cooldown (RMS re-trigger suppression)
         if (rp.provCooldownRemain > 0 && pp == rp.provCooldownNote) continue;
 
+        // High-note harmonic suppression: when a note >= E5 is active in
+        // another range, this provisional is likely a sympathetic harmonic.
+        if (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO) {
+            constexpr uint64_t highMask = ~((1ULL << (76 - NOTE_BASE)) - 1);
+            bool highActive = false;
+            for (const auto& other : m->ranges) {
+                if (other.get() == &rp) continue;
+                if (other->activeNotesBits.load(std::memory_order_acquire) & highMask)
+                    { highActive = true; break; }
+            }
+            if (highActive) continue;
+        }
+
         const bool mono = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
 
         // Mono: suppress if ANY other range already fired a provisional this onset.

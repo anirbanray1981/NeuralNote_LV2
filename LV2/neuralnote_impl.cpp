@@ -193,17 +193,22 @@ static void runWorker(NeuralNotePlugin* self)
                 if (prov != -1) {
                     const int currentProv = r.provNote.load(std::memory_order_acquire);
                     if (currentProv == prov) {
-                        // CNN result matches current provisional — normal two-phase path
                         r.provNote.store(-1, std::memory_order_release);
                         if (prov >= NOTE_BASE && prov < NOTE_BASE + NOTE_COUNT) {
-                            r.activeNotes |= (1ULL << (prov - NOTE_BASE));
-                            provForDiff = prov;
+                            if (swiftPoly) {
+                                // SwiftPoly: route to keep-alive instead of activeNotes.
+                                // CNN will confirm or the keep-alive expires with immediate OFF.
+                                const int bit = prov - NOTE_BASE;
+                                r.swiftPolyKeepBits  |= (1ULL << bit);
+                                r.swiftPolyKeepAge[bit] = SWIFT_POLY_KEEPALIVE;
+                            } else {
+                                r.activeNotes |= (1ULL << (prov - NOTE_BASE));
+                                provForDiff = prov;
+                            }
                         } else {
                             r.midiOut.push({false, prov, 0});
                         }
                     }
-                    // If stale (currentProv != prov): a new provisional has fired.
-                    // Leave provNote intact; pass provForDiff = -1 to avoid cancelling it.
                 }
 
                 const uint64_t prevActive = r.activeNotes;
@@ -433,14 +438,32 @@ static void runWorker(NeuralNotePlugin* self)
                             r.swiftPolyKeepBits  &= ~(1ULL << bit);
                             r.swiftPolyKeepAge[bit] = 0;
                         } else if (--r.swiftPolyKeepAge[bit] <= 0) {
-                            // Keep-alive expired — BasicPitch never confirmed
+                            // Keep-alive expired — BasicPitch never confirmed → immediate OFF
                             r.swiftPolyKeepBits  &= ~(1ULL << bit);
                             r.swiftPolyKeepAge[bit] = 0;
+                            r.midiOut.push({false, NOTE_BASE + bit, 0});
+                            r.activeNotes &= ~(1ULL << bit);
+                            r.holdNotes   &= ~(1ULL << bit);
                         } else {
                             // Still alive — inject into merged bitmap
                             newBits |= (1ULL << bit);
                             if (!newVel[bit]) newVel[bit] = 100;
                         }
+                    }
+
+                    // Active cancellation: if BasicPitch has notes, cancel any
+                    // keep-alive notes it disagrees with — BasicPitch is the authority.
+                    if (cnnBits && r.swiftPolyKeepBits) {
+                        const uint64_t mismatch = r.swiftPolyKeepBits & ~cnnBits;
+                        newBits &= ~mismatch;
+                        for (uint64_t tmp = mismatch; tmp; tmp &= tmp - 1) {
+                            const int bit = __builtin_ctzll(tmp);
+                            r.swiftPolyKeepAge[bit] = 0;
+                            r.midiOut.push({false, NOTE_BASE + bit, 0});
+                            r.activeNotes &= ~(1ULL << bit);
+                            r.holdNotes   &= ~(1ULL << bit);
+                        }
+                        r.swiftPolyKeepBits &= ~mismatch;
                     }
                 } else {
                     r.basicPitch->transcribeToMIDI(r.snapChan.data.data(),

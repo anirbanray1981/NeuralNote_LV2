@@ -263,13 +263,20 @@ static void runWorker(Monitor* m)
                 if (currentProv == snapProv) {
                     r.provNote.store(-1, std::memory_order_release);
                     if (snapProv >= NOTE_BASE && snapProv < NOTE_BASE + NOTE_COUNT) {
-                        r.activeNotes |= (1ULL << (snapProv - NOTE_BASE));
-                        provForDiff = snapProv;
+                        if (swiftPoly) {
+                            // SwiftPoly: route to keep-alive instead of activeNotes.
+                            // CNN will confirm or the keep-alive expires with immediate OFF.
+                            const int bit = snapProv - NOTE_BASE;
+                            r.swiftPolyKeepBits  |= (1ULL << bit);
+                            r.swiftPolyKeepAge[bit] = SWIFT_POLY_KEEPALIVE;
+                        } else {
+                            r.activeNotes |= (1ULL << (snapProv - NOTE_BASE));
+                            provForDiff = snapProv;
+                        }
                     } else {
                         r.midiOut.push({false, snapProv, 0});
                     }
                 }
-                // If stale: leave provNote intact; provForDiff stays -1.
             }
 
             uint64_t newBits = 0;
@@ -523,11 +530,16 @@ static void runWorker(Monitor* m)
                 r.swiftPolyKeepBits |= swiftBits;
 
                 // Age out keep-alive notes not refreshed by SwiftF0 this cycle.
+                // Expired keep-alive → immediate OFF (CNN never confirmed).
                 for (int b = 0; b < NOTE_COUNT; ++b) {
                     if (!(swiftBits & (1ULL << b)) && r.swiftPolyKeepAge[b] > 0)
                         --r.swiftPolyKeepAge[b];
-                    if (r.swiftPolyKeepAge[b] <= 0)
+                    if (r.swiftPolyKeepAge[b] <= 0 && (r.swiftPolyKeepBits & (1ULL << b))) {
                         r.swiftPolyKeepBits &= ~(1ULL << b);
+                        r.midiOut.push({false, NOTE_BASE + b, 0});
+                        r.activeNotes &= ~(1ULL << b);
+                        r.holdNotes   &= ~(1ULL << b);
+                    }
                 }
 
                 // Notes confirmed by BasicPitch leave keep-alive.
@@ -535,11 +547,39 @@ static void runWorker(Monitor* m)
                 for (uint64_t tmp = cnnBits; tmp; tmp &= tmp - 1)
                     r.swiftPolyKeepAge[__builtin_ctzll(tmp)] = 0;
 
+                // Active cancellation: if BasicPitch sees notes (cnnBits != 0),
+                // cancel any keep-alive notes it disagrees with. BasicPitch is
+                // the authority — if it detects E4 but not D#4, D#4 is wrong.
+                if (cnnBits && r.swiftPolyKeepBits) {
+                    const uint64_t mismatch = r.swiftPolyKeepBits & ~cnnBits;
+                    for (uint64_t tmp = mismatch; tmp; tmp &= tmp - 1) {
+                        const int bit = __builtin_ctzll(tmp);
+                        r.swiftPolyKeepAge[bit] = 0;
+                        r.midiOut.push({false, NOTE_BASE + bit, 0});
+                        r.activeNotes &= ~(1ULL << bit);
+                        r.holdNotes   &= ~(1ULL << bit);
+                    }
+                    r.swiftPolyKeepBits &= ~mismatch;
+                }
+
                 // Merged bitmap: BasicPitch base + keep-alive injection.
                 newBits = cnnBits | r.swiftPolyKeepBits;
                 std::memcpy(newVel, cnnVel, NOTE_COUNT);
                 for (uint64_t tmp = r.swiftPolyKeepBits & ~cnnBits; tmp; tmp &= tmp - 1)
                     newVel[__builtin_ctzll(tmp)] = 100;
+
+                // CNN log: only print when notes are detected (skip silent)
+                if (cnnBits) {
+                    const double elNow = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - m->startTime).count();
+                    for (uint64_t tmp = cnnBits; tmp; tmp &= tmp - 1) {
+                        const int p = NOTE_BASE + __builtin_ctzll(tmp);
+                        std::printf("[+%.3fs]  --   CNN → %-4s (%3d)  [range %s]\n",
+                                    elNow, midiToName(p).c_str(), p,
+                                    r.cfg.name.c_str());
+                    }
+                    std::fflush(stdout);
+                }
 
                 // SwiftF0 log dedup
                 if (effectiveNote != r.lastSwiftPrint) {
@@ -613,9 +653,8 @@ static void runWorker(Monitor* m)
                 }
                 std::fflush(stdout);
             } else if (swiftPoly) {
-                // SwiftPoly: polyphonic — mono=false
-                applyNotesDiff(r, newBits, newVel, provForDiff, false,
-                               r.cfg.swiftHoldCycles);
+                // SwiftPoly: polyphonic — mono=false, use default holdCycles (CNN cycle ~95ms)
+                applyNotesDiff(r, newBits, newVel, provForDiff, false);
                 const double elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - m->startTime).count();
                 for (uint64_t tmp = r.activeNotes & ~prevActive; tmp; tmp &= tmp - 1) {

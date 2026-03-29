@@ -196,11 +196,13 @@ static void runWorker(NeuralNotePlugin* self)
                         r.provNote.store(-1, std::memory_order_release);
                         if (prov >= NOTE_BASE && prov < NOTE_BASE + NOTE_COUNT) {
                             if (swiftPoly) {
-                                // SwiftPoly: route to keep-alive instead of activeNotes.
-                                // CNN will confirm or the keep-alive expires with immediate OFF.
+                                // SwiftPoly: route to keep-alive AND activeNotes.
+                                // activeNotes prevents applyNotesDiff double-ON since
+                                // processSynth already sent MIDI ON from audio thread.
                                 const int bit = prov - NOTE_BASE;
                                 r.swiftPolyKeepBits  |= (1ULL << bit);
                                 r.swiftPolyKeepAge[bit] = SWIFT_POLY_KEEPALIVE;
+                                r.activeNotes |= (1ULL << bit);
                             } else {
                                 r.activeNotes |= (1ULL << (prov - NOTE_BASE));
                                 provForDiff = prov;
@@ -465,6 +467,7 @@ static void runWorker(NeuralNotePlugin* self)
                         }
                         r.swiftPolyKeepBits &= ~mismatch;
                     }
+
                 } else {
                     r.basicPitch->transcribeToMIDI(r.snapChan.data.data(),
                                                     r.snapChan.snapshotSize);

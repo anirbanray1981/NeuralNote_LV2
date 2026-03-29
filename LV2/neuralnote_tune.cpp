@@ -264,11 +264,13 @@ static void runWorker(Monitor* m)
                     r.provNote.store(-1, std::memory_order_release);
                     if (snapProv >= NOTE_BASE && snapProv < NOTE_BASE + NOTE_COUNT) {
                         if (swiftPoly) {
-                            // SwiftPoly: route to keep-alive instead of activeNotes.
-                            // CNN will confirm or the keep-alive expires with immediate OFF.
+                            // SwiftPoly: route to keep-alive AND activeNotes.
+                            // activeNotes prevents applyNotesDiff double-ON since
+                            // processSynth already sent MIDI ON from audio thread.
                             const int bit = snapProv - NOTE_BASE;
                             r.swiftPolyKeepBits  |= (1ULL << bit);
                             r.swiftPolyKeepAge[bit] = SWIFT_POLY_KEEPALIVE;
+                            r.activeNotes |= (1ULL << bit);
                         } else {
                             r.activeNotes |= (1ULL << (snapProv - NOTE_BASE));
                             provForDiff = snapProv;

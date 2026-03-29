@@ -762,7 +762,7 @@ static void processSynth(Monitor* m, float* out, int nFrames)
         // another range, this provisional is likely a sympathetic harmonic.
         if (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO
             || m->mode == PlayMode::SWIFT_POLY) {
-            constexpr uint64_t highMask = ~((1ULL << (76 - NOTE_BASE)) - 1);
+            constexpr uint64_t highMask = ~((1ULL << (MIDI_NOTE_E5 - NOTE_BASE)) - 1);
             bool highActive = false;
             for (const auto& other : m->ranges) {
                 if (other.get() == &rp) continue;

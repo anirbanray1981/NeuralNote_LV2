@@ -835,7 +835,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 // High-note harmonic suppression: when a note >= E5 is active in
                 // another range, this provisional is likely a sympathetic harmonic.
                 if (self->modeVal.load(std::memory_order_relaxed) >= 1) {
-                    constexpr uint64_t highMask = ~((1ULL << (76 - NOTE_BASE)) - 1);
+                    constexpr uint64_t highMask = ~((1ULL << (MIDI_NOTE_E5 - NOTE_BASE)) - 1);
                     for (auto& other : self->ranges) {
                         if (&*other == &r) continue;
                         if (other->activeNotesBits.load(std::memory_order_acquire) & highMask)

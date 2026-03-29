@@ -14,6 +14,7 @@
  *   mode            = poly    # or mono, swiftmono, swiftpoly
  *   onset_blank_ms  = 25      # re-trigger suppression window (ms)
  *   swift_threshold = 0.5     # SwiftF0 per-frame confidence threshold (swiftmono mode)
+ *   provisional    = on      # on | swift | none — controls OBP+MPM provisional detection
  *
  *   [range]
  *   name            = E2-B2
@@ -41,6 +42,7 @@
 #include <vector>
 
 enum class PlayMode { POLY, MONO, SWIFT_MONO, SWIFT_POLY };
+enum class ProvMode { ON = 0, SWIFT = 1, NONE = 2 };
 
 struct NoteRange {
     std::string name         = "default";
@@ -60,7 +62,8 @@ struct RangeConfig {
     float     frameThreshold = 0.5f;   // frame confidence (0.05–0.95)
     float     onsetBlankMs      = 25.0f;  // re-trigger suppression window (ms)
     float     swiftF0Threshold  = 0.5f;   // SwiftF0 per-frame confidence (swiftmono mode)
-    PlayMode  mode           = PlayMode::MONO;
+    PlayMode  mode              = PlayMode::MONO;
+    ProvMode  provisionalMode  = ProvMode::ON;
 };
 
 // Return the first range whose [midiLow, midiHigh] contains pitch, or nullptr.
@@ -119,6 +122,12 @@ static inline RangeConfig loadRangeConfig(const std::string& path)
             else if (val == "swiftmono") cfg.mode = PlayMode::SWIFT_MONO;
             else if (val == "swiftpoly") cfg.mode = PlayMode::SWIFT_POLY;
             else                         cfg.mode = PlayMode::POLY;
+            continue;
+        }
+        if (key == "provisional") {
+            if      (val == "swift") cfg.provisionalMode = ProvMode::SWIFT;
+            else if (val == "none")  cfg.provisionalMode = ProvMode::NONE;
+            else                     cfg.provisionalMode = ProvMode::ON;
             continue;
         }
 

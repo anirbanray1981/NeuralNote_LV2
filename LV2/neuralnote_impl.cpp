@@ -79,6 +79,7 @@ enum PortIndex {
     PORT_FRAME_THRESHOLD = 6,
     PORT_MODE            = 7,
     PORT_ONSET_BLANK_MS  = 8,
+    PORT_PROVISIONAL     = 9,
 };
 
 // ── Mapped URIDs ──────────────────────────────────────────────────────────────
@@ -122,6 +123,7 @@ struct NeuralNotePlugin {
     const float*       frameThresholdPort;
     const float*       modePort;
     const float*       onsetBlankMsPort;
+    const float*       provisionalPort;
 
     double sampleRate;
 
@@ -129,6 +131,7 @@ struct NeuralNotePlugin {
     std::atomic<float> frameThresholdVal{0.5f};
     std::atomic<float> ampFloorVal{0.65f};
     std::atomic<int>   modeVal{1};  // 0=poly, 1=mono, 2=swiftmono, 3=swiftpoly (default: mono)
+    std::atomic<int>   provisionalVal{0};  // 0=on, 1=swift, 2=none
 
     std::unique_ptr<SwiftF0Detector> swiftF0;  // null if model not found
     std::vector<float>               sf0Buf;   // worker-thread scratch: 16 kHz resampled audio
@@ -171,6 +174,7 @@ struct ImplWorkerHooks {
     std::vector<float>& sf0Buf()         { return self->sf0Buf; }
     uint64_t            totalSamples()   { return self->totalSamples.load(std::memory_order_relaxed); }
     uint64_t            lastOnsetSample(){ return self->lastOnsetSample.load(std::memory_order_acquire); }
+    int                 provisionalMode(){ return self->provisionalVal.load(std::memory_order_relaxed); }
     auto&               ranges()         { return self->ranges; }
 
     // No logging in LV2 plugin
@@ -343,6 +347,7 @@ static void connectPort(LV2_Handle instance, uint32_t port, void* data)
         case PORT_FRAME_THRESHOLD: self->frameThresholdPort = static_cast<const float*>(data);       break;
         case PORT_MODE:            self->modePort           = static_cast<const float*>(data);       break;
         case PORT_ONSET_BLANK_MS:  self->onsetBlankMsPort   = static_cast<const float*>(data);       break;
+        case PORT_PROVISIONAL:    self->provisionalPort    = static_cast<const float*>(data);       break;
     }
 }
 
@@ -403,6 +408,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     if (self->thresholdPort)      self->thresholdVal.store(*self->thresholdPort, std::memory_order_relaxed);
     if (self->frameThresholdPort) self->frameThresholdVal.store(*self->frameThresholdPort, std::memory_order_relaxed);
     if (self->modePort)           self->modeVal.store(static_cast<int>(*self->modePort + 0.5f), std::memory_order_relaxed);
+    if (self->provisionalPort)    self->provisionalVal.store(static_cast<int>(*self->provisionalPort + 0.5f), std::memory_order_relaxed);
     if (self->ampFloor)           self->ampFloorVal.store(*self->ampFloor, std::memory_order_relaxed);
 
     if (self->audioOut)
@@ -480,7 +486,10 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         if (!gated) {
             pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));
 
-            // Two-phase OneBitPitch + MPM: arm on onset, expire after 100 ms.
+            // Two-phase OneBitPitch + MPM — skipped when provisional != on.
+            const bool provEnabled = (self->provisionalVal.load(std::memory_order_relaxed) == 0);
+            if (provEnabled) {
+
             armOrExpireOBP(r, static_cast<float>(self->sampleRate),
                            static_cast<int>(nSamples), onsetFired);
 
@@ -638,6 +647,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 }
             }
 #endif
+            } // provEnabled
         } else {
             // Silence: clear OBP / MPM state so stale data can't bleed into next note
             resetOBPOnGate(r);

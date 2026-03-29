@@ -127,6 +127,7 @@ struct Monitor {
     float    threshold      = 0.6f;
     float    frameThreshold = 0.5f;
     PlayMode mode           = PlayMode::POLY;
+    ProvMode provisionalMode = ProvMode::ON;
 
     std::vector<std::unique_ptr<RangeState>> ranges;
 
@@ -189,6 +190,7 @@ struct TuneWorkerHooks {
     std::vector<float>& sf0Buf()         { return m->sf0Buf; }
     uint64_t            totalSamples()   { return m->totalSamples.load(std::memory_order_relaxed); }
     uint64_t            lastOnsetSample(){ return m->lastOnsetSample.load(std::memory_order_acquire); }
+    int                 provisionalMode(){ return static_cast<int>(m->provisionalMode); }
     auto&               ranges()         { return m->ranges; }
 
     double elapsed() const {
@@ -571,7 +573,10 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
 
         pushRingSamples(r, resampled.data(), static_cast<int>(resampled.size()));
 
-        // Two-phase OneBitPitch + MPM: arm on onset, expire after 100 ms.
+        // Two-phase OneBitPitch + MPM — skipped when provisional != on.
+        const bool provEnabled = (m->provisionalMode == ProvMode::ON);
+        if (provEnabled) {
+
         armOrExpireOBP(r, static_cast<float>(m->sampleRate),
                        static_cast<int>(nFrames), onsetFired);
 
@@ -739,6 +744,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         } else if (gated) {
             resetOBPOnGate(r);
         }
+        } // provEnabled
 
         // Dispatch snapshot: linearise ring → snapshot slot, wake worker.
         dispatchSnapshotIfReady(r, onsetFired, r.provOnTimeMs, m->workerSem, m->gateFloor);
@@ -763,6 +769,8 @@ int main(int argc, char** argv)
     float    windowMs        = 150.0f;
     PlayMode mode            = PlayMode::POLY;
     bool     modeSet         = false;
+    ProvMode provisionalMode = ProvMode::ON;
+    bool     provisionalSet  = false;
     Waveform waveform       = Waveform::SINE;
     float    attackMs       = 10.0f;
     float    releaseMs      = 400.0f;
@@ -787,6 +795,13 @@ int main(int argc, char** argv)
             else                                   mode = PlayMode::POLY;
             modeSet = true;
         }
+        else if (!std::strcmp(argv[i], "--provisional")      && i+1 < argc) {
+            const char* s = argv[++i];
+            if      (!std::strcmp(s, "swift")) provisionalMode = ProvMode::SWIFT;
+            else if (!std::strcmp(s, "none"))  provisionalMode = ProvMode::NONE;
+            else                               provisionalMode = ProvMode::ON;
+            provisionalSet = true;
+        }
         else if (!std::strcmp(argv[i], "--attack")          && i+1 < argc) attackMs       = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--release")         && i+1 < argc) releaseMs      = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--volume")          && i+1 < argc) masterVol      = std::stof(argv[++i]);
@@ -799,7 +814,8 @@ int main(int argc, char** argv)
             std::fprintf(stderr,
                 "Usage: %s [--bundle PATH] [--config PATH]\n"
                 "          [--threshold F] [--frame-threshold F] [--mode mono|poly|swiftmono|swiftpoly]\n"
-                "          [--swift-threshold F] [--hold-cycles N] [--gate F] [--amp-floor F]\n"
+                "          [--swift-threshold F] [--provisional on|swift|none]\n"
+                "          [--hold-cycles N] [--gate F] [--amp-floor F]\n"
                 "          [--window MS] [--onset-blank MS]\n"
                 "          [--waveform sine|saw|square] [--attack MS] [--release MS] [--volume F]\n",
                 argv[0]);
@@ -853,6 +869,7 @@ int main(int argc, char** argv)
     if (onsetBlankMs   >= 0.0f)  rangeCfg.onsetBlankMs    = onsetBlankMs;
     if (swiftThreshold >= 0.0f)  rangeCfg.swiftF0Threshold = swiftThreshold;
     if (modeSet)                 rangeCfg.mode             = mode;
+    if (provisionalSet)          rangeCfg.provisionalMode  = provisionalMode;
 
     if (rangeCfg.ranges.empty()) {
         NoteRange low;
@@ -878,6 +895,9 @@ int main(int argc, char** argv)
                 rangeCfg.mode == PlayMode::SWIFT_POLY ? "swiftpoly" : "poly");
     if (rangeCfg.mode == PlayMode::SWIFT_MONO || rangeCfg.mode == PlayMode::SWIFT_POLY)
         std::printf("SwiftThr:   %.2f\n", rangeCfg.swiftF0Threshold);
+    std::printf("Provisional:%s\n",
+                rangeCfg.provisionalMode == ProvMode::SWIFT ? " swift" :
+                rangeCfg.provisionalMode == ProvMode::NONE  ? " none" : " on");
     std::printf("OnsetBlank: %.0f ms\n", rangeCfg.onsetBlankMs);
     std::printf("Dispatch:   window/2 per range (onset overrides; floor %.0f ms)\n",
                 MIN_FRESH_FLOOR / static_cast<float>(PLUGIN_SR) * 1000.0f);
@@ -904,6 +924,7 @@ int main(int argc, char** argv)
     mon.onsetBlankMs    = rangeCfg.onsetBlankMs;
     mon.swiftF0Threshold = rangeCfg.swiftF0Threshold;
     mon.mode            = rangeCfg.mode;
+    mon.provisionalMode = rangeCfg.provisionalMode;
 
     // Try to load SwiftF0 model
     {

@@ -677,7 +677,8 @@ static void runWorkerCommon(Hooks& h)
         const float ampFloor  = h.ampFloor();
         const int   modeNow   = h.mode();
         const bool  swiftMono = (modeNow == 2 && h.swiftF0() != nullptr);
-        const bool  swiftPoly = (modeNow == 3 && h.swiftF0() != nullptr);
+        const int   provMode  = h.provisionalMode();
+        const bool  swiftPoly = (modeNow == 3 && h.swiftF0() != nullptr && provMode != 2);
         const bool  mono      = (modeNow == 1 || modeNow == 2);
 
         auto& ranges = h.ranges();

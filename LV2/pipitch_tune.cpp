@@ -938,12 +938,8 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
     // ── GoertzelPoly: sample-by-sample in audio thread (AArch64 only) ───
 #ifdef __aarch64__
     if (m->mode == PlayMode::GOERTZEL_POLY && !gated) {
-        m->goertzel.processBlock(in, static_cast<int>(nFrames));
-
         const float transRatio = (m->pickFiredRemain > 0) ? 10.0f : 1.0f;
-        const float onThresh  = 0.08f;    // calibrated for decayed Goertzel magnitudes
-        const float offThresh = 0.02f;    // hysteresis
-        m->goertzel.update(transRatio, onThresh, offThresh);
+        m->goertzel.processBlock(in, static_cast<int>(nFrames), transRatio);
 
         // Check note states using triggerPending (fire-once per onset)
         auto& states = m->goertzel.getNoteStates();
@@ -958,7 +954,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
             auto& s = states[i];
             const uint64_t bit = 1ULL << (midi - NOTE_BASE);
 
-            if (s.isActive && !(m->goertzelPrevBits & bit)) {
+            if (s.isActive() && !(m->goertzelPrevBits & bit)) {
                 if (s.triggerPending) {
                     std::printf("[+%.3fs]  ON   %-4s (%3d)  vel %3d  [Goertzel]\n",
                                 elapsed, midiToName(midi).c_str(), midi, s.velocity);
@@ -973,7 +969,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                     m->goertzelPrevBits |= bit;
                     flushed = true;
                 }
-            } else if (!s.isActive && (m->goertzelPrevBits & bit)) {
+            } else if (!s.isActive() && (m->goertzelPrevBits & bit)) {
                 std::printf("[+%.3fs]  OFF  %-4s (%3d)  [Goertzel]\n",
                             elapsed, midiToName(midi).c_str(), midi);
                 for (auto& v : m->voices)

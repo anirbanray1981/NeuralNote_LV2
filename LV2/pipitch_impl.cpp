@@ -774,14 +774,8 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     // Only available on AArch64 (Pi 5) — requires NEON SIMD.
 #ifdef __aarch64__
     if (self->modeVal.load(std::memory_order_relaxed) == 4 && !gated) {
-        // Feed windowed audio block to Goertzel
-        self->goertzel.processBlock(self->audioIn, static_cast<int>(nSamples));
-
-        // Compute magnitudes and update note states
         const float transRatio = (self->pickFiredRemain > 0) ? 10.0f : 1.0f;
-        const float onThresh  = 0.08f;    // calibrated for decayed Goertzel magnitudes
-        const float offThresh = 0.02f;    // hysteresis
-        self->goertzel.update(transRatio, onThresh, offThresh);
+        self->goertzel.processBlock(self->audioIn, static_cast<int>(nSamples), transRatio);
 
         // Check note states using triggerPending (fire-once per onset)
         auto& states = self->goertzel.getNoteStates();
@@ -792,7 +786,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             auto& s = states[i];
             const uint64_t bit = 1ULL << (midi - NOTE_BASE);
 
-            if (s.isActive && !(self->goertzelPrevBits & bit)) {
+            if (s.isActive() && !(self->goertzelPrevBits & bit)) {
                 // New note-ON: only fire if triggerPending (prevents re-trigger)
                 if (s.triggerPending) {
                     writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
@@ -801,7 +795,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                     s.triggerPending = false;  // consume
                     self->goertzelPrevBits |= bit;
                 }
-            } else if (!s.isActive && (self->goertzelPrevBits & bit)) {
+            } else if (!s.isActive() && (self->goertzelPrevBits & bit)) {
                 // Note-OFF
                 writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
                           0x80, static_cast<uint8_t>(midi), uint8_t(0));

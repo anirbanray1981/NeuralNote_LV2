@@ -503,6 +503,14 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         RangeState& r = *rp;
 
         if (!gated) {
+            // Flush ring on PICK onset: zero stale audio so SwiftF0 only sees
+            // the new note.  Only on PICK (genuine attack), not RMS (energy fluctuation).
+            // Note: don't touch holdNotes/activeNotes here — those are worker-owned.
+            // The zeroed ring causes SwiftF0 to detect silence → notes expire via hold.
+            if (onsetFired && self->pickFiredRemain > 0) {
+                std::memset(r.ring.data(), 0, r.ringSize * sizeof(float));
+                r.freshSamples = 0;
+            }
             pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));
 
             // Two-phase OneBitPitch + MPM — skipped when provisional != on.

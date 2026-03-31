@@ -479,7 +479,7 @@ static void processSynth(Monitor* m, float* out, int nFrames)
                 // (don't retrigger envelope). This handles the muted→full velocity boost.
                 bool boosted = false;
                 for (int i = 0; i < MAX_VOICES; ++i) {
-                    if (m->voices[i].pitch == pn.pitch && m->voices[i].state == 1) {
+                    if (m->voices[i].pitch == pn.pitch && m->voices[i].state != 0 && m->voices[i].state != 3) {
                         m->voices[i].velocity = pn.value / 127.0f;
                         boosted = true;
                         std::printf("[+%.3fs]  >>   %-4s (%3d)  vel %3d"
@@ -624,6 +624,15 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
 
     for (auto& rp : m->ranges) {
         RangeState& r = *rp;
+
+        // Flush ring on PICK onset: zero stale audio so SwiftF0 only sees the new note.
+        // Only on PICK (genuine attack), not RMS (energy fluctuation).
+        // Don't touch holdNotes/activeNotes — those are worker-owned.
+        // The zeroed ring causes SwiftF0 to detect silence → notes expire via hold.
+        if (onsetFired && m->pickFiredRemain > 0) {
+            std::memset(r.ring.data(), 0, r.ringSize * sizeof(float));
+            r.freshSamples = 0;
+        }
 
         pushRingSamples(r, resampled.data(), static_cast<int>(resampled.size()));
 

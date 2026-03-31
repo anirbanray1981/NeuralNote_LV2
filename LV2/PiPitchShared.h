@@ -708,12 +708,15 @@ static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
         }
     }
 
-    // Active notes absent from newBits → start hold or OFF immediately
+    // Active notes absent from newBits → start hold or OFF immediately.
+    // In mono mode: bypass hold when new notes are appearing (immediate swap).
+    // monoSwap: immediate OFF for vanishing notes when new notes appear.
+    const bool monoSwap = mono && (newBits & ~r.activeNotes);
     for (uint64_t tmp = r.activeNotes & ~newBits & ~r.holdNotes; tmp; tmp &= tmp - 1) {
         const int  bit          = __builtin_ctzll(tmp);
         const bool cancelledProv = (prov != -1 && (NOTE_BASE + bit) == prov
                                     && !bmTest(newBits, prov));
-        if (holdCycles > 0 && !cancelledProv) {
+        if (holdCycles > 0 && !cancelledProv && !monoSwap) {
             r.holdNotes      |= (1ULL << bit);
             r.holdCounts[bit]  = static_cast<int8_t>(holdCycles);
         } else {
@@ -1163,7 +1166,7 @@ static void runWorkerCommon(Hooks& h)
                 && newBits != r.activeNotes) {
                 const uint64_t elSamp = h.totalSamples() - h.lastOnsetSample();
                 const float msSinceOnset = static_cast<float>(elSamp * 1000.0 / h.sampleRate());
-                if (msSinceOnset > 50.0f) {  // only on sustained notes, not transitions
+                if (msSinceOnset > 250.0f) {  // only on sustained notes well past attack
                     const int sf0Note = NOTE_BASE + static_cast<int>(__builtin_ctzll(newBits));
                     const int actNote = NOTE_BASE + static_cast<int>(__builtin_ctzll(r.activeNotes));
                     const int diff = sf0Note - actNote;

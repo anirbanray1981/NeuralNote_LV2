@@ -374,6 +374,14 @@ struct RangeStateBase {
     bool                lockArmed      = false; // true after first SwiftF0 confirmation
     int                 lockTTL        = 0;    // cycles remaining before lock expires
 
+    // Confirmation buffer: provisional is held for ~10ms before MIDI ON fires.
+    // If the worker pushes a correction within that window, use it instead.
+    int                 pendingProvNote    = -1;  // buffered provisional MIDI note
+    int                 pendingProvCountdown = 0; // samples remaining before firing
+
+    // OBP blanking: freeze OBP input for 5ms after PICK onset to skip pick noise
+    int                 obpBlankRemain = 0;
+
 #ifdef PIPITCH_ENABLE_MPM
     McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
 #endif

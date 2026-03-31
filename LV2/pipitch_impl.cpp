@@ -518,6 +518,14 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             const bool provEnabled = (pvNow == 0 || pvNow == 3);  // on or adaptive
             if (provEnabled) {
 
+            // OBP blanking: freeze OBP for 5ms after PICK to skip pick noise.
+            // The first 5ms of a pluck is mostly broadband noise that confuses OBP.
+            if (onsetFired && self->pickFiredRemain > 0)
+                r.obpBlankRemain = static_cast<int>(self->sampleRate * 0.005); // 5ms
+            const bool obpBlanked = (r.obpBlankRemain > 0);
+            if (obpBlanked)
+                r.obpBlankRemain -= static_cast<int>(nSamples);
+
             armOrExpireOBP(r, static_cast<float>(self->sampleRate),
                            static_cast<int>(nSamples), onsetFired);
 
@@ -627,14 +635,16 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                     r.provNote.store(note, std::memory_order_release);
                     r.monoHeldNote.store(note, std::memory_order_release);
                 } else {
-                    // Normal mode: send MIDI ON at muted velocity (~30%)
-                    writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                              0x90, static_cast<uint8_t>(note), uint8_t(40));
+                    // Confirmation buffer: hold provisional for ~10ms.
+                    // If the worker pushes a correction within that window,
+                    // use it instead. After timeout, fire at muted velocity.
+                    r.pendingProvNote = note;
+                    r.pendingProvCountdown = static_cast<int>(self->sampleRate * 0.010); // 10ms
                     r.provNote.store(note, std::memory_order_release);
                     r.monoHeldNote.store(note, std::memory_order_release);
                 }
-                r.provBentTo = -1;  // reset bend snap state
-                r.provNeedsBoost = (pv != 3);  // muted provisional needs velocity boost
+                r.provBentTo = -1;
+                r.provNeedsBoost = (pv != 3);
                 r.provCooldownRemain = static_cast<int>(self->sampleRate * 0.2);
                 r.provCooldownNote   = note;
             };
@@ -646,7 +656,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 r.mpm.push(self->audioIn, static_cast<int>(nSamples));
 #endif
 
-            if (r.obdOnsetActive) {
+            if (r.obdOnsetActive && !obpBlanked) {
                 if (r.provNote.load(std::memory_order_relaxed) == -1) {
                     const int finalNote = runOBPHPS(r, self->audioIn,
                                                     static_cast<int>(nSamples),
@@ -767,6 +777,22 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                           pn.type == PendingNote::NOTE_ON ? uint8_t(0x90) : uint8_t(0x80),
                           static_cast<uint8_t>(pn.pitch),
                           pn.type == PendingNote::NOTE_ON ? static_cast<uint8_t>(pn.value) : uint8_t(0));
+            }
+        }
+    }
+
+    // Confirmation buffer: fire buffered provisionals after 10ms timeout.
+    // If the worker pushed a correction (via midiOut drain above), the
+    // provisional was already superseded. Otherwise fire at muted velocity.
+    for (auto& rp : self->ranges) {
+        RangeState& r = *rp;
+        if (r.pendingProvNote >= 0) {
+            r.pendingProvCountdown -= static_cast<int>(nSamples);
+            if (r.pendingProvCountdown <= 0) {
+                // Timeout: fire the provisional at muted velocity
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          0x90, static_cast<uint8_t>(r.pendingProvNote), uint8_t(40));
+                r.pendingProvNote = -1;
             }
         }
     }

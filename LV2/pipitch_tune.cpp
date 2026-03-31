@@ -442,20 +442,15 @@ static void processSynth(Monitor* m, float* out, int nFrames)
                         elapsed, midiToName(pp).c_str(), pp, rp.cfg.name.c_str());
             std::fflush(stdout);
         } else {
-            // Normal: muted provisional (~30% velocity)
-            const float mutedVel = 40.0f / 127.0f;
+            // Confirmation buffer: hold provisional for ~10ms.
+            // If worker corrects within that window, use correction.
+            // After timeout, fire at muted velocity.
+            rp.pendingProvNote = pp;
+            rp.pendingProvCountdown = static_cast<int>(m->sampleRate * 0.010);
             std::printf("[+%.3fs]  ON   %-4s (%3d)  vel  40"
-                        "  [1-bit provisional  range %s]\n",
+                        "  [1-bit provisional BUFFERED 10ms  range %s]\n",
                         elapsed, midiToName(pp).c_str(), pp, rp.cfg.name.c_str());
             std::fflush(stdout);
-            int   best      = 0;
-            float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
-            for (int i = 0; i < MAX_VOICES; ++i) {
-                if (m->voices[i].state == 0) { best = i; break; }
-                const float l = m->voices[i].envLevel;
-                if (l < bestLevel) { bestLevel = l; best = i; }
-            }
-            m->voices[best] = { pp, midiToFreq(pp), 0.0, mutedVel, 1, 0.0f };
             rp.provNeedsBoost = true;
         }
         rp.provCooldownRemain = static_cast<int>(m->sampleRate * 0.2);
@@ -514,6 +509,25 @@ static void processSynth(Monitor* m, float* out, int nFrames)
                 for (int i = 0; i < MAX_VOICES; ++i)
                     if (m->voices[i].pitch == pn.pitch && m->voices[i].state != 0)
                         m->voices[i].state = 3;
+            }
+        }
+    }
+
+    // Confirmation buffer timeout: fire buffered provisionals after 10ms
+    for (auto& rp : m->ranges) {
+        RangeState& r = *rp;
+        if (r.pendingProvNote >= 0) {
+            r.pendingProvCountdown -= nFrames;
+            if (r.pendingProvCountdown <= 0) {
+                const float mutedVel = 40.0f / 127.0f;
+                int best = 0;
+                float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
+                for (int i = 0; i < MAX_VOICES; ++i) {
+                    if (m->voices[i].state == 0) { best = i; break; }
+                    if (m->voices[i].envLevel < bestLevel) { bestLevel = m->voices[i].envLevel; best = i; }
+                }
+                m->voices[best] = { r.pendingProvNote, midiToFreq(r.pendingProvNote), 0.0, mutedVel, 1, 0.0f };
+                r.pendingProvNote = -1;
             }
         }
     }
@@ -687,6 +701,13 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
             return false;
         };
 
+        // OBP blanking: freeze OBP for 5ms after PICK to skip pick noise
+        if (onsetFired && m->pickFiredRemain > 0)
+            r.obpBlankRemain = static_cast<int>(m->sampleRate * 0.005);
+        const bool obpBlanked = (r.obpBlankRemain > 0);
+        if (obpBlanked)
+            r.obpBlankRemain -= static_cast<int>(nFrames);
+
         armOrExpireOBP(r, static_cast<float>(m->sampleRate),
                        static_cast<int>(nFrames), onsetFired);
 
@@ -698,7 +719,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         if (!gated && (r.obdOnsetActive || r.obdPendingNote != -1))
             r.mpm.push(in, static_cast<int>(nFrames));
 
-        if (r.obdOnsetActive && !gated) {
+        if (r.obdOnsetActive && !gated && !obpBlanked) {
             if (r.provNote.load(std::memory_order_relaxed) == -1) {
                 const int finalNote = runOBPHPS(r, in,
                                                 static_cast<int>(nFrames),

@@ -19,16 +19,18 @@ maintaining accuracy:
    On every onset the audio thread runs:
    - **PickDetector**: 1st-order IIR HPF at 3 kHz isolates pick "snap";
      dual-EMA envelope (fast 0.1 ms / slow 20 ms) fires on transient ratio.
-     Two-tier: ratio >= 10 = immediate onset; 4–10 = confirmed by RMS.
+     Two-tier: ratio >= 10 = immediate onset; 3–10 = confirmed by RMS.
+   - **OBP blanking**: 5 ms freeze after PICK onset to skip pick noise.
    - **OBP** (OneBitPitchDetector): 4th-order Butterworth LP → adaptive Schmitt
      trigger → period averaging.  Requires 4 consecutive agreeing readings.
    - **HPS** (bit-parallel Harmonic Product Spectrum): cross-range OBP
      registers are shifted ×2 and ×3 to find the true fundamental.
    - **MPM** (McLeod Pitch Method, Pi 5 only): FFT autocorrelation + NSDF +
-     parabolic interpolation for a second independent pitch estimate.
+     parabolic interpolation.  Minimum 512 samples before trusting results.
+   - **Confirmation buffer**: provisional held for ~10 ms before MIDI ON fires.
+     If the worker corrects within that window, the correction is used instead.
 
-   A provisional MIDI note-ON fires as soon as OBP + HPS + MPM all agree.
-   Controllable via the `provisional` parameter (on / swift / none).
+   Controllable via the `provisional` parameter (on / adaptive / swift / none).
 
 2. **Inference confirmation** (worker thread)
    A background worker thread (`runWorkerCommon<Hooks>` in `PiPitchShared.h`)
@@ -45,24 +47,55 @@ maintaining accuracy:
 ```
 JACK callback (RT thread)
   ├─ PickDetector  (HPF 3 kHz → dual-EMA → transient ratio)
+  ├─ OBP blanking  (5 ms freeze after PICK — skip pick noise)
   ├─ RMS onset     (fallback for hammer-ons / volume swells)
   ├─ OBP + HPS + MPM  ──────────────────────────── provisional fire
+  ├─ Confirmation buffer (10 ms hold before MIDI ON)
   ├─ Ring buffer fill  (22 050 Hz resampled audio)
+  ├─ Ring flush on PICK onset (zero stale audio)
   └─ Snapshot dispatch → worker thread (lockless SPSC)
        │
        ├─ [mode 0/1]  BasicPitch CNN (~95 ms)
        │     └─ buildNNBits → cancel grace → applyNotesDiff
        │
        ├─ [mode 2]    SwiftF0 (~10–20 ms)
-       │     └─ resample 22050→16 kHz → infer → onset grace
-       │        → ghost suppression → note-change confirmation
-       │        → cancel grace → applyNotesDiff
+       │     └─ resample 22050→16 kHz → infer → note lock
+       │        → onset grace → ghost suppression
+       │        → note-change confirmation → pitch bend snap
+       │        → cancel grace → applyNotesDiff → velocity boost
        │
        └─ [mode 3]    SwiftF0 + BasicPitch
              └─ SwiftF0 (~5 ms) → BasicPitch (~95 ms) → merge
                 keep-alive bridge → active cancellation
                 → cancel grace → applyNotesDiff
 ```
+
+### Provisional glitch reduction
+
+| Technique | Description |
+|-----------|------------|
+| **Muted provisional** | Provisionals fire at vel 40 (~30%); boosted to 100 after SwiftF0 confirms |
+| **Pitch bend snap** | ±1-3 semitone corrections use pitch bend instead of OFF+ON (no ADSR retrigger) |
+| **Note lock** | Once SwiftF0 confirms, note is locked until next onset (prevents E4→silent→E4 oscillation) |
+| **Confirmation buffer** | 10 ms hold before MIDI ON; worker can correct within that window |
+| **OBP blanking** | 5 ms freeze after PICK skips pick noise in OBP |
+| **Octave lock** | Cross-range ±12/±24 semitone suppression with onset timing gate |
+| **Range priority** | In swiftMono, highest MIDI note wins across ranges |
+| **Mono swap** | Immediate OFF for old notes when new note appears (no hold delay) |
+| **From-silence filter** | Suppress provisionals below C3 from silence |
+
+### 14-bit pitch bend
+
+When `bend = on` (LV2 port 10), the PitchBendTracker provides conditional
+pitch bend for natural vibrato and string bending:
+
+| Gate | Threshold | Purpose |
+|------|-----------|---------|
+| Onset mask | 30 ms | No bend during attack transient |
+| Stability | confidence > 0.85 for 3 frames | Only bend on stable sustained notes |
+| Dead zone | ±5 cents | Keep perfectly in tune |
+| Active zone | 5–100 cents | 14-bit bend (±2 semitone range) |
+| Decay guard | SwiftF0 must detect same MIDI note | Snap to center when pitch drifts on decay |
 
 ### Worker thread architecture
 
@@ -96,11 +129,11 @@ PiPitch/
 │   ├── pipitch_tune.cpp     ← JACK tuning tool (TuneWorkerHooks + synth)
 │   ├── pipitch.cpp           ← LV2 wrapper (CPU dispatch via dlopen)
 │   ├── PiPitchShared.h      ← Shared: constants, pipeline, runWorkerCommon<Hooks>
-│   ├── SwiftF0Detector.h    ← SwiftF0 ONNX wrapper
+│   ├── SwiftF0Detector.h    ← SwiftF0 ONNX wrapper (returns Hz + confidence)
 │   ├── plugin.ttl / manifest.ttl
 │   ├── pipitch_ranges.conf  ← Per-range config (shipped in bundle)
 │   ├── pipitch_tune.conf    ← Tune tool config (includes global keys)
-│   ├── pipitch-connect.sh   ← JACK MIDI fan-out script
+│   ├── pipitch-connect.sh   ← JACK MIDI fan-out + synth discovery
 │   └── pipitch-connect.service
 ├── CMakeLists.txt           ← LV2 build (references NeuralNote/ submodule)
 └── README.md
@@ -121,7 +154,8 @@ PiPitch/
 | 6 | `frame_threshold` | 0.5 | 0.05–0.95 | Per-frame CNN confidence |
 | 7 | `mode` | 1 | 0–3 | Poly / Mono / SwiftMono / SwiftPoly |
 | 8 | `onset_blank_ms` | 25 | 10–100 | Re-trigger suppression (ms) |
-| 9 | `provisional` | 0 | 0–2 | On / Swift / None — controls OBP+MPM pipeline |
+| 9 | `provisional` | 0 | 0–3 | On / Swift / None / Adaptive |
+| 10 | `bend` | 0 | 0–1 | Pitch bend Off / On |
 
 ---
 
@@ -145,25 +179,6 @@ cmake --build build -j$(nproc)
 | `PiPitchImpl_ARMv82` | `pipitch_impl_armv82.so` | Pi 5 (ARMv8.2-A, dotprod+fp16) — MPM enabled |
 | `pipitch_tune` | `pipitch_tune` | JACK tuning tool (requires JACK + FFTW3f) |
 | `latency_bench` | `latency_bench` | Offline latency benchmark |
-
-### Bundle layout
-
-```
-build/pipitch.lv2/
-├── manifest.ttl
-├── plugin.ttl
-├── pipitch.so                  ← LV2 host loads this
-├── pipitch_impl_neon.so        ← Pi 4 impl
-├── pipitch_impl_armv82.so      ← Pi 5 impl
-├── pipitch_ranges.conf
-├── swift_f0_model.onnx
-└── ModelData/
-    ├── cnn_contour_model.json
-    ├── cnn_note_model.json
-    ├── cnn_onset_1_model.json
-    ├── cnn_onset_2_model.json
-    └── features_model.ort
-```
 
 ### Pi 5 — manual rebuild
 
@@ -211,7 +226,8 @@ console logging and a built-in synth engine for audio feedback.
 pipitch_tune [--bundle PATH] [--config PATH]
              [--threshold 0.6] [--frame-threshold 0.5]
              [--mode poly|mono|swiftmono|swiftpoly]
-             [--swift-threshold 0.5] [--provisional on|swift|none]
+             [--swift-threshold 0.5] [--provisional on|adaptive|swift|none|off]
+             [--bend] [--octave-lock MS]
              [--gate 0.003] [--amp-floor 0.65]
              [--onset-blank MS] [--window MS] [--hold-cycles N]
              [--waveform sine|saw|square]
@@ -251,13 +267,12 @@ systemctl restart zynthian
 
 ---
 
-## MIDI fan-out — multiple synth chains
+## MIDI routing
 
 **`pipitch-connect.sh`** runs at boot via `pipitch-connect.service` and:
-1. Connects `PiPitch-01:midi_out → ZynMidiRouter:dev0_in` (essential)
-2. Fans `ZynMidiRouter:ch0_out` out to extra synth chains listed in `FANOUT_DSTS`
-
-Edit `FANOUT_DSTS` in the script to match your Zynthian layout.
+1. Connects `PiPitch-01:midi_out → ZynMidiRouter:dev0_in` (Zynthian integration)
+2. Dynamically discovers all synth engine MIDI inputs
+3. Connects PiPitch directly to each synth (low-latency bypass)
 
 ```bash
 systemctl enable  pipitch-connect.service   # persists across reboots
@@ -270,6 +285,37 @@ in `/zynthian/config/midi-profiles/default.sh`.
 
 ---
 
+## Configuration keys
+
+### Global (pipitch_tune.conf / CLI)
+
+| Key | CLI | Default | Description |
+|-----|-----|---------|-------------|
+| `gate_floor` | `--gate` | 0.003 | Noise gate floor |
+| `amp_floor` | `--amp-floor` | 0.65 | BasicPitch amplitude floor |
+| `threshold` | `--threshold` | 0.6 | Onset sensitivity |
+| `frame_threshold` | `--frame-threshold` | 0.5 | Per-frame CNN confidence |
+| `mode` | `--mode` | mono | poly / mono / swiftmono / swiftpoly |
+| `provisional` | `--provisional` | on | on / adaptive / swift / none / off |
+| `onset_blank_ms` | `--onset-blank` | 25 | Re-trigger suppression (ms) |
+| `swift_threshold` | `--swift-threshold` | 0.5 | SwiftF0 confidence threshold |
+| `octave_lock_ms` | `--octave-lock` | 250 | Octave jump suppression window (ms) |
+| `bend` | `--bend` | off | Enable 14-bit pitch bend |
+
+### Per-range (pipitch_ranges.conf)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `name` | — | Range label |
+| `midi_low` | — | Lowest MIDI note (inclusive) |
+| `midi_high` | — | Highest MIDI note (inclusive) |
+| `window` | 150 | CNN capture window (ms) |
+| `min_note_length` | 6 | Minimum CNN frames |
+| `hold_cycles` | 2 | Inference cycles before note-OFF |
+| `swift_hold_cycles` | 2 | Hold cycles for SwiftF0 |
+
+---
+
 ## Key constants
 
 | Constant | Value | Meaning |
@@ -279,10 +325,6 @@ in `/zynthian/config/midi-profiles/default.sh`.
 | `PLUGIN_SR` | 22 050 Hz | Resampled rate fed to BasicPitch CNN |
 | `OBP_NOTE_CAP` | 76 | OBP provisionals above E5 rejected |
 | `N_CONSEC` | 4 | Consecutive agreeing OBP readings to fire |
-| `ONSET_RATIO` | 3.0× | RMS fallback onset threshold |
-| `ONSET_BLANK_MS` | 25 ms | Default re-trigger suppression |
-| `ONSET_GATE_S` | 0.25 s | Decay-tail ghost suppression window |
-| `PICK_HIGH_TIER` | 10.0 | PickDetector tier-1 ratio |
 | `MPM_FFTSIZE` | 4 096 | MPM FFT size |
 | `MPM_K` | 0.86 | NSDF key-maximum threshold |
 | `SWIFT_POLY_KEEPALIVE` | 2 | SwiftF0 keep-alive cycles in swiftpoly |

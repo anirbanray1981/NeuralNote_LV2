@@ -241,14 +241,42 @@ PiPitch/
 
 ## Building
 
+### Prerequisites
+
+- **LV2 development headers**: `sudo apt install lv2-dev`
+- **JACK** (for tune/test tools): `sudo apt install libjack-jackd2-dev`
+- **FFTW3** (for MPM pitch detection): `sudo apt install libfftw3-dev`
+- **ONNX Runtime** (for SwiftF0): the NeuralNote submodule includes pre-built
+  libraries for Linux aarch64 at `NeuralNote/ThirdParty/onnxruntime/lib-linux-aarch64/`.
+  On the Pi 5 build environment, these are manually placed at that path
+  (not tracked in git).  For other platforms, download ONNX Runtime from
+  https://github.com/microsoft/onnxruntime/releases and either:
+  - Place it at `NeuralNote/ThirdParty/onnxruntime/` (with `include/` and
+    `lib*/` subdirectories), or
+  - Install system-wide (`sudo cp libonnxruntime.so* /usr/local/lib/ &&
+    sudo ldconfig`), or
+  - Pass `-DCMAKE_PREFIX_PATH=/path/to/onnxruntime` to CMake.
+
+On Raspberry Pi OS (aarch64):
 ```bash
-# From the repository root (requires NeuralNote submodule)
+sudo apt install lv2-dev libjack-jackd2-dev libfftw3-dev
+```
+
+### Build
+
+```bash
 git clone --recurse-submodules https://github.com/anirbanray1981/PiPitch.git
 cd PiPitch
 
 cmake -B build -DBUILD_LV2=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
+
+**Note:** If CMake cannot find `onnxruntime`, ensure the NeuralNote submodule
+is fully initialised (`git submodule update --init --recursive`) and that the
+pre-built library exists at `NeuralNote/ThirdParty/onnxruntime/lib-linux-aarch64/`.
+For x86_64 or other platforms, install ONNX Runtime system-wide or pass
+`-DCMAKE_PREFIX_PATH` to CMake.
 
 ### Build targets
 

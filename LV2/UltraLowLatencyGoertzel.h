@@ -60,6 +60,8 @@ public:
         bool isActive() const { return isMidiOn; }
     };
 
+    static constexpr int   CONFIDENCE_VHIGH  = 14;      // eval cycles for E2 (~56ms)
+    static constexpr int   CONFIDENCE_HIGH2  = 10;      // eval cycles for notes F2–A#2 (~40ms)
     static constexpr int   CONFIDENCE_HIGH   = 6;       // eval cycles for notes below F4 (~24ms)
     static constexpr int   CONFIDENCE_LOW    = 3;       // eval cycles for notes F4 and above (~12ms)
     static constexpr int   HOLD_EVAL_CYCLES  = 8;       // ~32ms hold after note-ON (8 × 4ms)
@@ -116,7 +118,9 @@ public:
             float scale = ratio;  // linear: modest low-note threshold boost
             noteOnThresh_[i] = ON_THRESHOLD * scale;
             // Notes below F4 (MIDI 65) need more confidence to avoid spectral leakage triggers
-            noteConfidence_[i] = (midi < 65) ? CONFIDENCE_HIGH : CONFIDENCE_LOW;
+            noteConfidence_[i] = (midi <= 40) ? CONFIDENCE_VHIGH :
+                                (midi < 47)  ? CONFIDENCE_HIGH2 :
+                                (midi < 65)  ? CONFIDENCE_HIGH : CONFIDENCE_LOW;
         }
 
         // Pre-compute Hann window for EVAL_INTERVAL
@@ -193,7 +197,8 @@ public:
      * @param nSamples   Block size (typically 64)
      * @param onsetFired True if a pick onset was detected THIS block
      */
-    void processBlock(const float* input, int nSamples, bool onsetFired = false)
+    void processBlock(const float* input, int nSamples, bool onsetFired = false,
+                       bool polyMode = false)
     {
         if (nSamples <= 0 || nSamples > MAX_BLOCK_SIZE) return;
 
@@ -201,6 +206,32 @@ public:
         if (onsetFired) {
             blankRemain_ = onsetBlankSamples_;
             onsetRemain_ = onsetWindowSamples_;
+
+            // Onset quench: accelerate decay for active notes so new note
+            // can build confidence.  DISABLED in polyMode — chord strums need
+            // notes to accumulate, not cancel each other.
+            if (!polyMode) {
+                constexpr float ONSET_QUENCH = 0.5f;
+                for (int i = 0; i < numNotes_; ++i) {
+                    if (noteStates_[i].isMidiOn) {
+                        noteStates_[i].activeCount = 0;
+                        noteStates_[i].holdRemain  = 0;
+                        int gi = i / 4, lane = i % 4;
+#ifdef __aarch64__
+                        float s1[4], s2[4];
+                        vst1q_f32(s1, groups_[gi].s1);
+                        vst1q_f32(s2, groups_[gi].s2);
+                        s1[lane] *= ONSET_QUENCH;
+                        s2[lane] *= ONSET_QUENCH;
+                        groups_[gi].s1 = vld1q_f32(s1);
+                        groups_[gi].s2 = vld1q_f32(s2);
+#else
+                        groups_[gi].s1[lane] *= ONSET_QUENCH;
+                        groups_[gi].s2[lane] *= ONSET_QUENCH;
+#endif
+                    }
+                }
+            }
         }
 
         // Feed samples through Goertzel IIR (always — maintains state continuity)

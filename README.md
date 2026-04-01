@@ -589,7 +589,11 @@ extra/missing segments.
 
 ## License
 
-PiPitch LV2 plugin code is original work by Anirban Ray.
-BasicPitch model and inference code from [NeuralNote](https://github.com/DamRsn/NeuralNote)
-(Apache-2.0). Dependencies: [RTNeural](https://github.com/jatinchowdhury18/RTNeural) (BSD-3),
+PiPitch LV2 plugin code is original work by Anirban Ray.  Free for personal,
+educational, and open-source use.  Commercial use requires a separate license
+from the author.  See [LICENSE](LICENSE) for full terms.
+
+Third-party dependencies:
+[NeuralNote/BasicPitch](https://github.com/DamRsn/NeuralNote) (Apache-2.0),
+[RTNeural](https://github.com/jatinchowdhury18/RTNeural) (BSD-3),
 [ONNX Runtime](https://github.com/microsoft/onnxruntime) (MIT).

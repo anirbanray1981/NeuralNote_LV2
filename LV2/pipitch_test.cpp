@@ -738,8 +738,7 @@ static void processTestBlock(TestState* st, const float* blockIn, int nSamples)
     // GoertzelPoly audio-thread processing
 #ifdef __aarch64__
     if (st->mode == PlayMode::GOERTZEL_POLY && !gated) {
-        st->goertzel.processBlock(blockIn, nSamples,
-                                   onsetFired && st->pickFiredRemain > 0);
+        st->goertzel.processBlock(blockIn, nSamples, onsetFired);
 
         auto& states = st->goertzel.getNoteStates();
         const int gStart = st->goertzel.startMidi();
@@ -773,13 +772,20 @@ static void processTestBlock(TestState* st, const float* blockIn, int nSamples)
             }
         }
     } else if (st->mode == PlayMode::GOERTZEL_POLY && gated) {
-        for (uint64_t tmp = st->goertzelPrevBits; tmp; tmp &= tmp - 1) {
-            const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
-            std::lock_guard<std::mutex> lock(st->eventsMtx);
-            st->events.push_back({st->audioTimeS.load(std::memory_order_relaxed), p, false, 0});
+        st->goertzel.drainGated(nSamples);
+        auto& states = st->goertzel.getNoteStates();
+        const int gStart = st->goertzel.startMidi();
+        const double el = st->audioTimeS.load(std::memory_order_relaxed);
+        for (int i = 0; i < st->goertzel.numNotes(); ++i) {
+            const int midi = gStart + i;
+            if (midi < NOTE_BASE || midi >= NOTE_BASE + NOTE_COUNT) continue;
+            const uint64_t bit = 1ULL << (midi - NOTE_BASE);
+            if (!states[i].isActive() && (st->goertzelPrevBits & bit)) {
+                std::lock_guard<std::mutex> lock(st->eventsMtx);
+                st->events.push_back({el, midi, false, 0});
+                st->goertzelPrevBits &= ~bit;
+            }
         }
-        st->goertzelPrevBits = 0;
-        st->goertzel.reset();
     }
 #endif
 

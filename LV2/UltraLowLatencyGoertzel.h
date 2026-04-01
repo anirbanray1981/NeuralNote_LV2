@@ -50,6 +50,7 @@ public:
         int   activeCount   = 0;
         int   inactiveCount = 0;
         int   holdRemain    = 0;    // eval cycles remaining in hold (delays OFF)
+        int   offGrace      = 0;    // eval cycles after OFF where harmonics are still suppressed
         bool  isMidiOn      = false;
         bool  triggerPending = false;
         int   velocity       = 0;
@@ -59,8 +60,10 @@ public:
         bool isActive() const { return isMidiOn; }
     };
 
-    static constexpr int   CONFIDENCE_BLOCKS = 3;       // blocks above threshold to trigger ON
-    static constexpr int   HOLD_EVAL_CYCLES  = 6;       // ~30ms hold after note-ON (6 × 5.3ms)
+    static constexpr int   CONFIDENCE_HIGH   = 6;       // eval cycles for notes below F4 (~24ms)
+    static constexpr int   CONFIDENCE_LOW    = 3;       // eval cycles for notes F4 and above (~12ms)
+    static constexpr int   HOLD_EVAL_CYCLES  = 8;       // ~32ms hold after note-ON (8 × 4ms)
+    static constexpr int   OFF_GRACE_CYCLES  = 50;      // ~200ms grace after OFF for harmonic suppression
     static constexpr int   MAX_BLOCK_SIZE    = 256;
     static constexpr float DECAY_FACTOR      = 0.99985f; // ~50ms half-life at 48kHz
     static constexpr float ON_THRESHOLD      = 0.08f;    // base magnitude for note-ON
@@ -69,14 +72,16 @@ public:
 
     // Onset blanking: freeze detection for this many samples after onset
     static constexpr float ONSET_BLANK_MS    = 5.0f;
-    // Onset-aware elevated threshold: scale ON_THRESHOLD by this during onset window
-    static constexpr float ONSET_THRESH_MULT = 20.0f;
-    static constexpr float ONSET_WINDOW_MS   = 200.0f;   // how long elevated threshold lasts
+    // Onset-aware elevated threshold: scale ON_THRESHOLD by this during onset window.
+    // Kept moderate — frequency-scaled thresholds already reject transients for low notes.
+    static constexpr float ONSET_THRESH_MULT = 8.0f;
+    static constexpr float ONSET_WINDOW_MS   = 50.0f;    // how long elevated threshold lasts
     // Multi-block accumulation: evaluate notes every N samples (not every block)
-    static constexpr int   EVAL_INTERVAL     = 256;      // ~5.3ms at 48kHz
+    static constexpr int   EVAL_INTERVAL     = 192;      // ~4ms at 48kHz
     // Harmonic suppression minimum magnitude floor — below this,
     // relative comparisons are unreliable (noise floor artifacts).
     static constexpr float HARMONIC_MAG_FLOOR = 0.1f;
+    static constexpr float WTA_INCUMBENT_MULT = 3.0f;  // active note must lose by this factor to be zeroed
 
     UltraLowLatencyGoertzel() = default;
 
@@ -100,14 +105,18 @@ public:
         // Low notes (E2=82Hz) need ~4× higher threshold than mid notes (E4=330Hz)
         // because their IIR resonators ring longer from impulse noise.
         noteOnThresh_.resize(numNotes_);
+        noteConfidence_.resize(numNotes_);
         for (int i = 0; i < numNotes_; ++i) {
             int midi = startMidi + i;
             float freq = 440.0f * std::pow(2.0f, (midi - 69) / 12.0f);
-            // Scale factor: 1.0 at 330Hz (E4), rises quadratically for lower notes.
-            // E2 (82Hz) gets ~16× higher threshold; E3 (165Hz) gets ~4×.
+            // Scale factor: 1.0 at 330Hz (E4), rises linearly for lower notes.
+            // E2 (82Hz) gets ~4× higher threshold; E3 (165Hz) gets ~2×.
+            // Onset blank + onset mult + confidence already handle impulse ringing.
             float ratio = std::max(1.0f, 330.0f / freq);
-            float scale = ratio * ratio;  // quadratic: low bins need much higher threshold
+            float scale = ratio;  // linear: modest low-note threshold boost
             noteOnThresh_[i] = ON_THRESHOLD * scale;
+            // Notes below F4 (MIDI 65) need more confidence to avoid spectral leakage triggers
+            noteConfidence_[i] = (midi < 65) ? CONFIDENCE_HIGH : CONFIDENCE_LOW;
         }
 
         // Pre-compute Hann window for EVAL_INTERVAL
@@ -147,6 +156,35 @@ public:
             }
 #endif
         }
+    }
+
+    /**
+     * Fast-drain for gated silence.  Applies aggressive decay to IIR state
+     * and runs note evaluation so active notes turn off promptly.
+     * Call once per callback when the noise gate is closed.
+     */
+    void drainGated(int nSamples)
+    {
+        // Apply aggressive per-sample decay: 0.995^64 ≈ 0.73 per block,
+        // reaching 1% in ~5 blocks (~7ms).  Much faster than normal decay.
+        constexpr float GATE_DECAY = 0.995f;
+        const float factor = std::pow(GATE_DECAY, static_cast<float>(nSamples));
+#ifdef __aarch64__
+        const float32x4_t fv = vdupq_n_f32(factor);
+        for (int i = 0; i < numGroups_; ++i) {
+            groups_[i].s1 = vmulq_f32(groups_[i].s1, fv);
+            groups_[i].s2 = vmulq_f32(groups_[i].s2, fv);
+        }
+#else
+        for (int i = 0; i < numGroups_; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                groups_[i].s1[j] *= factor;
+                groups_[i].s2[j] *= factor;
+            }
+        }
+#endif
+        computeMagnitudes();
+        updateNotes();
     }
 
     /**
@@ -231,7 +269,7 @@ public:
 #endif
         }
         for (auto& s : noteStates_) {
-            s.activeCount = s.inactiveCount = s.holdRemain = 0;
+            s.activeCount = s.inactiveCount = s.holdRemain = s.offGrace = 0;
             s.isMidiOn = s.triggerPending = false;
             s.velocity = 0;
             s.currentMag = 0.0f;
@@ -288,27 +326,38 @@ private:
 
             // Check against ORIGINAL magnitudes (raw[]) so earlier suppression
             // doesn't affect later comparisons.
+            if (i >= 11 && raw[i - 11] > val * 0.15f) val *= 0.01f;  // near-octave (leakage from H2)
             if (i >= 12 && raw[i - 12] > val * 0.15f) val *= 0.01f;  // octave
+            if (i >= 13 && raw[i - 13] > val * 0.15f) val *= 0.01f;  // near-octave+1
+            if (i >= 23 && raw[i - 23] > val * 0.15f) val *= 0.01f;  // near-2oct
             if (i >= 24 && raw[i - 24] > val * 0.15f) val *= 0.01f;  // 2 octaves
+            if (i >= 25 && raw[i - 25] > val * 0.15f) val *= 0.01f;  // near-2oct+1
             if (i >= 7  && raw[i - 7]  > val * 0.15f) val *= 0.02f;  // fifth
             if (i >= 19 && raw[i - 19] > val * 0.15f) val *= 0.02f;  // octave+fifth
             if (i >= 4  && raw[i - 4]  > val * 0.3f)  val *= 0.05f;  // major third
             if (i >= 5  && raw[i - 5]  > val * 0.3f)  val *= 0.05f;  // fourth
             if (i >= 16 && raw[i - 16] > val * 0.2f)  val *= 0.02f;  // octave+fourth
+            if (i >= 15 && raw[i - 15] > val * 0.2f)  val *= 0.02f;  // oct+minor third (H3 leakage)
             if (i >= 28 && raw[i - 28] > val * 0.15f) val *= 0.01f;  // 2oct+third
             if (i >= 31 && raw[i - 31] > val * 0.15f) val *= 0.01f;  // 2oct+fifth (H6)
             m[i] = val;
         }
 
-        // Winner-takes-all per octave
+        // Winner-takes-all per octave — incumbent advantage.
+        // An already-ON note needs the competitor to be WTA_INCUMBENT_MULT×
+        // stronger to be dethroned.  Prevents decay-phase toggling between
+        // adjacent semitones while still allowing real note transitions
+        // (new pick attack easily exceeds the margin).
         for (int i = 0; i < numNotes_; ++i) {
             if (m[i] <= 0.0f) continue;
             const int lo = std::max(0, i - 6);
             const int hi = std::min(numNotes_ - 1, i + 5);
-            float maxInOctave = 0.0f;
+            float maxCompetitor = 0.0f;
             for (int k = lo; k <= hi; ++k)
-                if (k != i && m[k] > maxInOctave) maxInOctave = m[k];
-            if (maxInOctave > 0.0f && m[i] < maxInOctave)
+                if (k != i && m[k] > maxCompetitor) maxCompetitor = m[k];
+            if (maxCompetitor <= 0.0f) continue;
+            float bar = noteStates_[i].isMidiOn ? m[i] * WTA_INCUMBENT_MULT : m[i];
+            if (maxCompetitor > bar)
                 m[i] = 0.0f;
         }
 
@@ -335,13 +384,20 @@ private:
                 if (s.isMidiOn)
                     s.holdRemain = HOLD_EVAL_CYCLES;  // refresh hold while active
 
-                if (s.activeCount >= CONFIDENCE_BLOCKS && !s.isMidiOn) {
-                    s.isMidiOn       = true;
-                    s.triggerPending = true;
-                    s.holdRemain     = HOLD_EVAL_CYCLES;
+                if (s.activeCount >= noteConfidence_[i] && !s.isMidiOn) {
+                    // No harmonic guards here — onset gating at the MIDI
+                    // emission layer prevents ghost notes.  Goertzel just
+                    // tracks what it detects; the caller decides what to send.
                     float norm = std::clamp(val / (noteOnThresh_[i] * 20.0f), 0.0f, 1.0f);
-                    s.velocity = static_cast<int>(127.0f * std::pow(norm, 1.0f / 1.2f));
-                    s.velocity = std::max(10, s.velocity);
+                    int vel = static_cast<int>(127.0f * std::pow(norm, 1.0f / 1.2f));
+                    if (vel < 25) {
+                        s.activeCount = 0;
+                    } else {
+                        s.isMidiOn       = true;
+                        s.triggerPending = true;
+                        s.holdRemain     = HOLD_EVAL_CYCLES;
+                        s.velocity       = vel;
+                    }
                 }
             } else if (val < OFF_THRESHOLD) {
                 s.inactiveCount++;
@@ -350,13 +406,17 @@ private:
                 if (s.isMidiOn) {
                     if (s.holdRemain > 0) {
                         s.holdRemain--;  // hold — don't turn off yet
-                    } else if (s.inactiveCount >= CONFIDENCE_BLOCKS) {
+                    } else if (s.inactiveCount >= noteConfidence_[i]) {
                         s.isMidiOn       = false;
                         s.triggerPending = false;
+                        s.offGrace       = OFF_GRACE_CYCLES;
                     }
                 }
             }
             // Between OFF_THRESHOLD and dynamicOn: hysteresis hold
+
+            // Decrement off-grace timer
+            if (s.offGrace > 0) s.offGrace--;
         }
     }
 
@@ -373,6 +433,7 @@ private:
     std::vector<NoteState>  noteStates_;
     std::vector<float>      magBuf_;
     std::vector<float>      noteOnThresh_;  // per-bin ON threshold (frequency-scaled)
+    std::vector<int>        noteConfidence_; // per-bin confidence (eval cycles to trigger ON)
     std::vector<float>      evalHann_;      // Hann window for eval interval
     std::vector<float>      accumBuf_;      // accumulation buffer
 };

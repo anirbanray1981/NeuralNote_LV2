@@ -43,6 +43,7 @@ maintaining accuracy:
    | **mono** (1) | BasicPitch CNN | ~95 ms | Monophonic (single highest-velocity note) |
    | **swiftmono** (2) | SwiftF0 ONNX | ~10–20 ms | Monophonic; 389 KB model, 16 kHz input |
    | **swiftpoly** (3) | SwiftF0 + BasicPitch | ~100 ms | SwiftF0 for fast note-ON, BasicPitch for sustain/OFF |
+   | **goertzelpoly** (4) | UltraLowLatencyGoertzel | ~5 ms | Zero-latency polyphonic; NEON SIMD, Pi 5 only |
 
 ```
 JACK callback (RT thread)
@@ -64,10 +65,17 @@ JACK callback (RT thread)
        │        → note-change confirmation → pitch bend snap
        │        → cancel grace → applyNotesDiff → velocity boost
        │
-       └─ [mode 3]    SwiftF0 + BasicPitch
-             └─ SwiftF0 (~5 ms) → BasicPitch (~95 ms) → merge
-                keep-alive bridge → active cancellation
-                → cancel grace → applyNotesDiff
+       ├─ [mode 3]    SwiftF0 + BasicPitch
+       │     └─ SwiftF0 (~5 ms) → BasicPitch (~95 ms) → merge
+       │        keep-alive bridge → active cancellation
+       │        → cancel grace → applyNotesDiff
+       │
+       └─ [mode 4]    GoertzelPoly (audio thread, no worker)
+             └─ UltraLowLatencyGoertzel: 49-bin IIR resonator bank
+                onset blanking (5 ms) → multi-block eval (192 samples)
+                frequency-scaled thresholds → onset ramp (50 ms)
+                harmonic suppression → winner-takes-all (incumbent 3×)
+                → onset-gated note-ON → pitch snap (±2 semitone bend)
 ```
 
 ### Provisional glitch reduction
@@ -133,6 +141,8 @@ PiPitch/
 │   ├── plugin.ttl / manifest.ttl
 │   ├── pipitch_ranges.conf  ← Per-range config (shipped in bundle)
 │   ├── pipitch_tune.conf    ← Tune tool config (includes global keys)
+│   ├── pipitch_test.cpp     ← Record/test regression tool
+│   ├── UltraLowLatencyGoertzel.h ← GoertzelPoly: 49-bin NEON Goertzel detector
 │   ├── pipitch-connect.sh   ← JACK MIDI fan-out + synth discovery
 │   └── pipitch-connect.service
 ├── CMakeLists.txt           ← LV2 build (references NeuralNote/ submodule)
@@ -152,7 +162,7 @@ PiPitch/
 | 4 | `gate_floor` | 0.003 | 0.0–0.1 | Noise gate floor |
 | 5 | `amp_floor` | 0.65 | 0.0–1.0 | BasicPitch amplitude floor |
 | 6 | `frame_threshold` | 0.5 | 0.05–0.95 | Per-frame CNN confidence |
-| 7 | `mode` | 1 | 0–3 | Poly / Mono / SwiftMono / SwiftPoly |
+| 7 | `mode` | 1 | 0–4 | Poly / Mono / SwiftMono / SwiftPoly / GoertzelPoly |
 | 8 | `onset_blank_ms` | 25 | 10–100 | Re-trigger suppression (ms) |
 | 9 | `provisional` | 0 | 0–3 | On / Swift / None / Adaptive |
 | 10 | `bend` | 0 | 0–1 | Pitch bend Off / On |
@@ -178,6 +188,7 @@ cmake --build build -j$(nproc)
 | `PiPitchImpl_NEON` | `pipitch_impl_neon.so` | Pi 4 (ARMv8-A, NEON) — no MPM |
 | `PiPitchImpl_ARMv82` | `pipitch_impl_armv82.so` | Pi 5 (ARMv8.2-A, dotprod+fp16) — MPM enabled |
 | `pipitch_tune` | `pipitch_tune` | JACK tuning tool (requires JACK + FFTW3f) |
+| `pipitch_test` | `pipitch_test` | Record/test regression tool (requires JACK) |
 | `latency_bench` | `latency_bench` | Offline latency benchmark |
 
 ### Pi 5 — manual rebuild
@@ -283,6 +294,9 @@ journalctl -u pipitch-connect.service       # view output
 For all chains to receive MIDI simultaneously, set `ZYNTHIAN_MIDI_SINGLE_ACTIVE_CHANNEL="0"`
 in `/zynthian/config/midi-profiles/default.sh`.
 
+**Note:** GoertzelPoly mode outputs on MIDI channel 2.  Configure your synth
+chain to listen on channel 2 accordingly.
+
 ---
 
 ## Configuration keys
@@ -295,7 +309,7 @@ in `/zynthian/config/midi-profiles/default.sh`.
 | `amp_floor` | `--amp-floor` | 0.65 | BasicPitch amplitude floor |
 | `threshold` | `--threshold` | 0.6 | Onset sensitivity |
 | `frame_threshold` | `--frame-threshold` | 0.5 | Per-frame CNN confidence |
-| `mode` | `--mode` | mono | poly / mono / swiftmono / swiftpoly |
+| `mode` | `--mode` | mono | poly / mono / swiftmono / swiftpoly / goertzelpoly |
 | `provisional` | `--provisional` | on | on / adaptive / swift / none / off |
 | `onset_blank_ms` | `--onset-blank` | 25 | Re-trigger suppression (ms) |
 | `swift_threshold` | `--swift-threshold` | 0.5 | SwiftF0 confidence threshold |
@@ -328,6 +342,129 @@ in `/zynthian/config/midi-profiles/default.sh`.
 | `MPM_FFTSIZE` | 4 096 | MPM FFT size |
 | `MPM_K` | 0.86 | NSDF key-maximum threshold |
 | `SWIFT_POLY_KEEPALIVE` | 2 | SwiftF0 keep-alive cycles in swiftpoly |
+
+---
+
+## GoertzelPoly mode (mode 4)
+
+Zero-latency polyphonic pitch detection using a 49-bin Goertzel IIR resonator
+bank running entirely in the audio thread (no worker needed).  Pi 5 only
+(requires AArch64 NEON SIMD).
+
+### Signal processing pipeline
+
+1. **Onset blanking** (5 ms): After a pick onset, note detection freezes while
+   the IIR filters continue running.  Prevents broadband transient from
+   triggering all 49 bins.
+
+2. **Multi-block evaluation** (192 samples / ~4 ms): IIR processes
+   sample-by-sample, but magnitudes and note decisions are computed every 192
+   samples — enough for the Goertzel to resolve guitar fundamentals.
+
+3. **Frequency-scaled thresholds**: Low-frequency bins (E2 = 82 Hz) require
+   ~4× higher magnitude than mid-range bins (E4 = 330 Hz).  Linear scaling:
+   `threshold = base × (330/freq)`.
+
+4. **Onset-aware dynamic threshold** (50 ms ramp): ON threshold elevated up to
+   8× immediately after onset, ramping linearly back to normal.  Rejects
+   residual broadband energy while allowing the true fundamental to grow.
+
+5. **Harmonic suppression**: Checks against raw (pre-suppression) magnitudes;
+   suppresses octave (±1 semitone tolerance), fifth, third, fourth, and higher
+   harmonics when a lower potential fundamental is present.  Minimum magnitude
+   floor of 0.1 to avoid noise-floor artifacts.
+
+6. **Winner-takes-all with incumbent advantage**: Within each 12-note octave
+   window, only the strongest bin survives.  An already-ON note needs the
+   competitor to be 3× stronger to be dethroned — prevents decay-phase
+   toggling between adjacent semitones.
+
+7. **Hold timer** (8 eval cycles / ~32 ms): Once a note turns ON, it stays ON
+   for at least 32 ms even if magnitude briefly dips.  Prevents ON/OFF
+   flickering from magnitude oscillation near threshold.
+
+8. **Onset-gated note-ON**: New note-ONs are only allowed within a 250 ms
+   window after a pick/RMS onset.  The first note to fire closes the window
+   (one note per onset).  This single rule replaces all harmonic guard logic —
+   no onset means no new notes, so decay-phase ghosts, sub-harmonics, and
+   adjacent-semitone leakage are all suppressed.
+
+9. **Pitch snap**: When Goertzel detects a note change within ±2 semitones of
+   the currently-sounding note, a MIDI pitch bend is sent instead of OFF+ON.
+   This avoids synth ADSR re-trigger glitches.  The bend is centered on the
+   next pick onset or when the note turns off.
+
+10. **Octave-lock**: New Goertzel note-ONs are suppressed if ±12/±24 semitones
+    from an already-active note.
+
+11. **Minimum velocity** (25): Goertzel detections below velocity 25 are
+    rejected as noise-floor artifacts.
+
+### MIDI channel
+
+GoertzelPoly outputs on MIDI channel 2 (0-indexed: 1) to avoid double-triggering
+when routed through both ZynMidiRouter and direct synth connections.
+
+### Limitations
+
+- Provisionals (OBP+MPM) are disabled in GoertzelPoly mode
+- The ring buffer / CNN / SwiftF0 pipeline is bypassed entirely
+- Best suited for monophonic playing; chord detection still noisy
+
+---
+
+## `pipitch_test` — record & regression test tool
+
+A standalone tool for recording guitar audio and testing PiPitch detection
+accuracy against labeled note sequences.
+
+### Record mode
+
+Capture live audio from JACK and save to WAV on Ctrl+C:
+
+```bash
+pipitch_test record -o guitar_e4.wav [--port system:capture_1]
+```
+
+### Test mode
+
+Feed a WAV file through the full PiPitch pipeline and compare detected notes
+against a label file:
+
+```bash
+pipitch_test test -i guitar_e4.wav -l labels.txt \
+    [--mode goertzelpoly] [--config pipitch_tune.conf]
+```
+
+### Label file format
+
+**Mono** — one note per line (played in sequence):
+
+```
+mono
+E4
+D4
+F#4
+```
+
+**Chord** — one chord per line (played in sequence):
+
+```
+chord
+Em
+G
+Am
+```
+
+Supported chord qualities: major, minor (`m`), 7th (`7`), minor 7th (`m7`),
+major 7th (`maj7`), diminished (`dim`), augmented (`aug`), sus2, sus4,
+power (`5`).
+
+### Scoring
+
+The tool segments detected MIDI events by silence gaps and matches segments to
+labels in order.  Reports hits, partial hits, misses, wrong notes, and
+extra/missing segments.
 
 ---
 

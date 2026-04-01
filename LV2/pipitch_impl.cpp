@@ -83,6 +83,12 @@ enum PortIndex {
     PORT_BEND            = 10,
 };
 
+// ── MIDI output channel (0-indexed: 0 = ch1, 1 = ch2, etc.) ──────────────────
+static constexpr uint8_t MIDI_CH         = 1;   // channel 2 (Zynthian ch2)
+static constexpr uint8_t NOTE_ON_STATUS  = 0x90 | MIDI_CH;
+static constexpr uint8_t NOTE_OFF_STATUS = 0x80 | MIDI_CH;
+static constexpr uint8_t PITCH_BEND_STATUS = 0xE0 | MIDI_CH;
+
 // ── Mapped URIDs ──────────────────────────────────────────────────────────────
 
 struct URIs {
@@ -138,6 +144,13 @@ struct PiPitchPlugin {
     float              octaveLockMsVal = 250.0f;  // from config (not an LV2 port)
 
     std::unique_ptr<SwiftF0Detector> swiftF0;  // null if model not found
+#ifdef __aarch64__
+    UltraLowLatencyGoertzel          goertzel; // GoertzelPoly mode (audio-thread, zero-latency)
+    uint64_t goertzelPrevBits = 0;
+    int      goertzelBentFrom = -1;  // MIDI note the synth has (note-ON was sent for this)
+    int      goertzelBentTo   = -1;  // MIDI note we've bent to (what Goertzel considers active)
+    int      goertzelNoteWindow = 0; // samples remaining: new note-ONs only when > 0
+#endif
     std::vector<float>               sf0Buf;   // worker-thread scratch: 16 kHz resampled audio
 
     std::vector<std::unique_ptr<RangeState>> ranges;
@@ -332,6 +345,9 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
     }
 
     self->pickDetector.init(static_cast<float>(rate), 3000.0f, 3.0f);
+#ifdef __aarch64__
+    self->goertzel.init(static_cast<float>(rate), NOTE_BASE, NOTE_BASE + NOTE_COUNT - 1);
+#endif
 
     sem_init(&self->workerSem, 0, 0);
     self->workerThread = std::thread(runWorker, self);
@@ -409,10 +425,10 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 const uint8_t lsb = static_cast<uint8_t>(pn.value & 0x7F);
                 const uint8_t msb = static_cast<uint8_t>((pn.value >> 7) & 0x7F);
                 writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                          uint8_t(0xE0), lsb, msb);
+                          PITCH_BEND_STATUS, lsb, msb);
             } else {
                 writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                          pn.type == PendingNote::NOTE_ON ? uint8_t(0x90) : uint8_t(0x80),
+                          pn.type == PendingNote::NOTE_ON ? NOTE_ON_STATUS : NOTE_OFF_STATUS,
                           static_cast<uint8_t>(pn.pitch),
                           pn.type == PendingNote::NOTE_ON ? static_cast<uint8_t>(pn.value) : uint8_t(0));
                 // Clear pending provisional if worker already sent this note
@@ -502,8 +518,11 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     static const float zeros[8192] = {};
 
     // Push audio into each range's ring; dispatch snapshot when ready — lockless
+    // GoertzelPoly bypasses the entire ring/OBP/CNN pipeline.
+    const bool goertzelMode = (self->modeVal.load(std::memory_order_relaxed) == 4);
     for (auto& rp : self->ranges) {
         RangeState& r = *rp;
+        if (goertzelMode) continue;
 
         if (!gated) {
             // Flush ring on onset: zero stale audio so SwiftF0 only sees the
@@ -516,6 +535,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));
 
             // Two-phase OneBitPitch + MPM — skipped when provisional != on.
+            // (GoertzelPoly never reaches here — range loop is skipped above.)
             const int pvNow = self->provisionalVal.load(std::memory_order_relaxed);
             const bool provEnabled = (pvNow == 0 || pvNow == 3);  // on or adaptive
             if (provEnabled) {
@@ -596,7 +616,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                         if (note < 48 && self->lastPickRatio < 4.0f) return;
                         // PICK-triggered re-hit: send OFF first for clean retrigger
                         writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                                  0x80, static_cast<uint8_t>(note), uint8_t(0));
+                                  NOTE_OFF_STATUS, static_cast<uint8_t>(note), uint8_t(0));
                     } else if (bits != 0) {
                         // Transition: defer MIDI ON, store for SwiftF0 consensus.
                         // Clear provNote so worker doesn't silently insert into activeNotes.
@@ -614,7 +634,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                         const int held = other->monoHeldNote.load(std::memory_order_acquire);
                         if (held != -1 && held != note) {
                             writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                                      0x80, static_cast<uint8_t>(held), uint8_t(0));
+                                      NOTE_OFF_STATUS, static_cast<uint8_t>(held), uint8_t(0));
                             other->monoHeldNote.store(-1, std::memory_order_release);
                         }
                     }
@@ -623,11 +643,11 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 {   const int oldProv = r.provNote.load(std::memory_order_acquire);
                     if (oldProv != -1 && oldProv != note) {
                         writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                                  0x80, static_cast<uint8_t>(oldProv), uint8_t(0));
+                                  NOTE_OFF_STATUS, static_cast<uint8_t>(oldProv), uint8_t(0));
                         // Reset pitch bend if it was snapped
                         if (r.provBentTo >= 0) {
                             writeMidi(&self->forge, 1, self->uris.midi_MidiEvent,
-                                      0xE0, uint8_t(0), uint8_t(0x40)); // center
+                                      PITCH_BEND_STATUS, uint8_t(0), uint8_t(0x40)); // center
                         }
                     }
                 }
@@ -763,6 +783,150 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         dispatchSnapshotIfReady(r, onsetFired, 0.0, self->workerSem, gateFloor);
     }
 
+    // ── GoertzelPoly: sample-by-sample processing in audio thread ──────────
+    // Only available on AArch64 (Pi 5) — requires NEON SIMD.
+#ifdef __aarch64__
+    if (self->modeVal.load(std::memory_order_relaxed) == 4 && !gated) {
+        self->goertzel.processBlock(self->audioIn, static_cast<int>(nSamples), onsetFired);
+
+        auto& states = self->goertzel.getNoteStates();
+        const int gStart = self->goertzel.startMidi();
+
+        // Onset gate: open a window for new note-ONs on each onset.
+        // First note-ON to fire closes the window — one note per onset.
+        if (onsetFired) {
+            self->goertzelNoteWindow = static_cast<int>(self->sampleRate * 0.25);  // 250ms
+            // Center any active pitch bend (clean slate for new note)
+            if (self->goertzelBentFrom >= 0) {
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          PITCH_BEND_STATUS, uint8_t(0), uint8_t(0x40));
+                self->goertzelBentFrom = -1;
+                self->goertzelBentTo   = -1;
+            }
+        }
+        if (self->goertzelNoteWindow > 0)
+            self->goertzelNoteWindow -= static_cast<int>(nSamples);
+
+        // ── Pass 1: collect note transitions ──
+        struct { int midi, vel; } gOn[4];   int nOn  = 0;
+        struct { int midi; }      gOff[4];  int nOff = 0;
+
+        for (int i = 0; i < self->goertzel.numNotes(); ++i) {
+            const int midi = gStart + i;
+            if (midi < NOTE_BASE || midi >= NOTE_BASE + NOTE_COUNT) continue;
+            auto& s = states[i];
+            const uint64_t bit = 1ULL << (midi - NOTE_BASE);
+
+            if (s.isActive() && s.triggerPending && !(self->goertzelPrevBits & bit)) {
+                bool octLocked = false;
+                for (uint64_t tmp = self->goertzelPrevBits; tmp; tmp &= tmp - 1) {
+                    const int act = NOTE_BASE + __builtin_ctzll(tmp);
+                    const int diff = std::abs(midi - act);
+                    if (diff == 12 || diff == 24) { octLocked = true; break; }
+                }
+                s.triggerPending = false;
+                if (!octLocked && nOn < 4)
+                    gOn[nOn++] = { midi, s.velocity };
+            }
+            if (!s.isActive() && (self->goertzelPrevBits & bit)) {
+                if (nOff < 4)
+                    gOff[nOff++] = { midi };
+            }
+        }
+
+        // ── Pass 2: pitch snap or normal MIDI emission ──
+        // Onset gate: note-ONs only when goertzelNoteWindow > 0.
+        // Pitch snap allowed anytime (corrects an already-sounding note).
+        const bool noteOnAllowed = self->goertzelNoteWindow > 0;
+
+        bool snapped = false;
+        if (nOn == 1 && nOff == 1 && self->goertzelPrevBits != 0) {
+            // Pitch snap: correct an already-sounding note via bend (no onset needed)
+            const int soundingNote =
+                (self->goertzelBentFrom >= 0 && gOff[0].midi == self->goertzelBentTo)
+                ? self->goertzelBentFrom : gOff[0].midi;
+            const int diff = gOn[0].midi - soundingNote;
+            if (diff != 0 && std::abs(diff) <= 2) {
+                const float cents = static_cast<float>(diff) * 100.0f;
+                int bv = 8192 + static_cast<int>((cents / 200.0f) * 8191.0f);
+                bv = std::clamp(bv, 0, 16383);
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          PITCH_BEND_STATUS,
+                          static_cast<uint8_t>(bv & 0x7F),
+                          static_cast<uint8_t>((bv >> 7) & 0x7F));
+                self->goertzelBentFrom = soundingNote;
+                self->goertzelBentTo   = gOn[0].midi;
+                self->goertzelPrevBits &= ~(1ULL << (gOff[0].midi - NOTE_BASE));
+                self->goertzelPrevBits |=  (1ULL << (gOn[0].midi  - NOTE_BASE));
+                snapped = true;
+            }
+        }
+
+        if (!snapped) {
+            // Handle bent-note OFF: send OFF for the sounding note + center bend
+            if (self->goertzelBentFrom >= 0) {
+                for (int j = 0; j < nOff; ++j) {
+                    if (gOff[j].midi == self->goertzelBentTo) {
+                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                  PITCH_BEND_STATUS, uint8_t(0), uint8_t(0x40));
+                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                  NOTE_OFF_STATUS,
+                                  static_cast<uint8_t>(self->goertzelBentFrom), uint8_t(0));
+                        self->goertzelPrevBits &= ~(1ULL << (gOff[j].midi - NOTE_BASE));
+                        self->goertzelBentFrom = -1;
+                        self->goertzelBentTo   = -1;
+                        gOff[j].midi = -1;
+                        break;
+                    }
+                }
+                if (nOn > 0 && self->goertzelBentFrom >= 0) {
+                    writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                              PITCH_BEND_STATUS, uint8_t(0), uint8_t(0x40));
+                    self->goertzelBentFrom = -1;
+                    self->goertzelBentTo   = -1;
+                }
+            }
+            // Normal ON events — onset-gated, one note per onset
+            for (int j = 0; j < nOn; ++j) {
+                if (!noteOnAllowed) continue;  // no onset → suppress
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          NOTE_ON_STATUS, static_cast<uint8_t>(gOn[j].midi),
+                          static_cast<uint8_t>(gOn[j].vel));
+                self->goertzelPrevBits |= (1ULL << (gOn[j].midi - NOTE_BASE));
+                self->goertzelNoteWindow = 0;  // one note per onset — close window
+            }
+            // Normal OFF events
+            for (int j = 0; j < nOff; ++j) {
+                if (gOff[j].midi < 0) continue;  // consumed by bent-note handler
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          NOTE_OFF_STATUS, static_cast<uint8_t>(gOff[j].midi), uint8_t(0));
+                self->goertzelPrevBits &= ~(1ULL << (gOff[j].midi - NOTE_BASE));
+            }
+        }
+    } else if (self->modeVal.load(std::memory_order_relaxed) == 4 && gated) {
+        // Center any active bend before gated drain
+        if (self->goertzelBentFrom >= 0) {
+            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                      PITCH_BEND_STATUS, uint8_t(0), uint8_t(0x40));
+            self->goertzelBentFrom = -1;
+            self->goertzelBentTo   = -1;
+        }
+        self->goertzel.drainGated(static_cast<int>(nSamples));
+        auto& states = self->goertzel.getNoteStates();
+        const int gStart = self->goertzel.startMidi();
+        for (int i = 0; i < self->goertzel.numNotes(); ++i) {
+            const int midi = gStart + i;
+            if (midi < NOTE_BASE || midi >= NOTE_BASE + NOTE_COUNT) continue;
+            const uint64_t bit = 1ULL << (midi - NOTE_BASE);
+            if (!states[i].isActive() && (self->goertzelPrevBits & bit)) {
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          NOTE_OFF_STATUS, static_cast<uint8_t>(midi), uint8_t(0));
+                self->goertzelPrevBits &= ~bit;
+            }
+        }
+    }
+#endif // __aarch64__
+
     // Second drain: catch any CNN events the worker pushed during this callback.
     // The first drain (top of run) caught events from before this cycle;
     // this one reduces CNN note latency by up to one JACK buffer.
@@ -773,10 +937,10 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 const uint8_t lsb = static_cast<uint8_t>(pn.value & 0x7F);
                 const uint8_t msb = static_cast<uint8_t>((pn.value >> 7) & 0x7F);
                 writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                          uint8_t(0xE0), lsb, msb);
+                          PITCH_BEND_STATUS, lsb, msb);
             } else {
                 writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                          pn.type == PendingNote::NOTE_ON ? uint8_t(0x90) : uint8_t(0x80),
+                          pn.type == PendingNote::NOTE_ON ? NOTE_ON_STATUS : NOTE_OFF_STATUS,
                           static_cast<uint8_t>(pn.pitch),
                           pn.type == PendingNote::NOTE_ON ? static_cast<uint8_t>(pn.value) : uint8_t(0));
                 if (pn.type == PendingNote::NOTE_ON && rp->pendingProvNote == pn.pitch)
@@ -795,7 +959,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             if (r.pendingProvCountdown <= 0) {
                 // Timeout: fire the provisional at muted velocity
                 writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                          0x90, static_cast<uint8_t>(r.pendingProvNote), uint8_t(40));
+                          NOTE_ON_STATUS, static_cast<uint8_t>(r.pendingProvNote), uint8_t(40));
                 r.pendingProvNote = -1;
             }
         }

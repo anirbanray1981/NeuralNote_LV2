@@ -72,9 +72,10 @@ JACK callback (RT thread)
        │
        └─ [mode 4]    GoertzelPoly (audio thread, no worker)
              └─ UltraLowLatencyGoertzel: 49-bin IIR resonator bank
-                onset blanking (5 ms) → multi-block eval (256 samples)
-                frequency-scaled thresholds → onset ramp (200 ms)
-                harmonic suppression → winner-takes-all → hold timer
+                onset blanking (5 ms) → multi-block eval (192 samples)
+                frequency-scaled thresholds → onset ramp (50 ms)
+                harmonic suppression → winner-takes-all (incumbent 3×)
+                → onset-gated note-ON → pitch snap (±2 semitone bend)
 ```
 
 ### Provisional glitch reduction
@@ -293,6 +294,9 @@ journalctl -u pipitch-connect.service       # view output
 For all chains to receive MIDI simultaneously, set `ZYNTHIAN_MIDI_SINGLE_ACTIVE_CHANNEL="0"`
 in `/zynthian/config/midi-profiles/default.sh`.
 
+**Note:** GoertzelPoly mode outputs on MIDI channel 2.  Configure your synth
+chain to listen on channel 2 accordingly.
+
 ---
 
 ## Configuration keys
@@ -353,33 +357,53 @@ bank running entirely in the audio thread (no worker needed).  Pi 5 only
    the IIR filters continue running.  Prevents broadband transient from
    triggering all 49 bins.
 
-2. **Multi-block evaluation** (256 samples / ~5.3 ms): IIR processes
-   sample-by-sample, but magnitudes and note decisions are computed every 256
+2. **Multi-block evaluation** (192 samples / ~4 ms): IIR processes
+   sample-by-sample, but magnitudes and note decisions are computed every 192
    samples — enough for the Goertzel to resolve guitar fundamentals.
 
 3. **Frequency-scaled thresholds**: Low-frequency bins (E2 = 82 Hz) require
-   16× higher magnitude than mid-range bins (E4 = 330 Hz).  Quadratic scaling:
-   `threshold = base × (330/freq)²`.  Eliminates low-frequency ringing from
-   mid-range attacks.
+   ~4× higher magnitude than mid-range bins (E4 = 330 Hz).  Linear scaling:
+   `threshold = base × (330/freq)`.
 
-4. **Onset-aware dynamic threshold** (200 ms ramp): ON threshold elevated up to
-   20× immediately after onset, ramping linearly back to normal.  Rejects
+4. **Onset-aware dynamic threshold** (50 ms ramp): ON threshold elevated up to
+   8× immediately after onset, ramping linearly back to normal.  Rejects
    residual broadband energy while allowing the true fundamental to grow.
 
 5. **Harmonic suppression**: Checks against raw (pre-suppression) magnitudes;
-   suppresses octave, fifth, third, fourth, and higher harmonics when a lower
-   potential fundamental is present.  Minimum magnitude floor of 0.1 to avoid
-   noise-floor artifacts.
+   suppresses octave (±1 semitone tolerance), fifth, third, fourth, and higher
+   harmonics when a lower potential fundamental is present.  Minimum magnitude
+   floor of 0.1 to avoid noise-floor artifacts.
 
-6. **Winner-takes-all**: Within each 12-note octave window, only the strongest
-   bin survives.
+6. **Winner-takes-all with incumbent advantage**: Within each 12-note octave
+   window, only the strongest bin survives.  An already-ON note needs the
+   competitor to be 3× stronger to be dethroned — prevents decay-phase
+   toggling between adjacent semitones.
 
-7. **Hold timer** (6 eval cycles / ~30 ms): Once a note turns ON, it stays ON
-   for at least 30 ms even if magnitude briefly dips.  Prevents ON/OFF
+7. **Hold timer** (8 eval cycles / ~32 ms): Once a note turns ON, it stays ON
+   for at least 32 ms even if magnitude briefly dips.  Prevents ON/OFF
    flickering from magnitude oscillation near threshold.
 
-8. **Octave-lock**: At the consumer level, new Goertzel note-ONs are suppressed
-   if ±12/±24 semitones from an already-active note.
+8. **Onset-gated note-ON**: New note-ONs are only allowed within a 250 ms
+   window after a pick/RMS onset.  The first note to fire closes the window
+   (one note per onset).  This single rule replaces all harmonic guard logic —
+   no onset means no new notes, so decay-phase ghosts, sub-harmonics, and
+   adjacent-semitone leakage are all suppressed.
+
+9. **Pitch snap**: When Goertzel detects a note change within ±2 semitones of
+   the currently-sounding note, a MIDI pitch bend is sent instead of OFF+ON.
+   This avoids synth ADSR re-trigger glitches.  The bend is centered on the
+   next pick onset or when the note turns off.
+
+10. **Octave-lock**: New Goertzel note-ONs are suppressed if ±12/±24 semitones
+    from an already-active note.
+
+11. **Minimum velocity** (25): Goertzel detections below velocity 25 are
+    rejected as noise-floor artifacts.
+
+### MIDI channel
+
+GoertzelPoly outputs on MIDI channel 2 (0-indexed: 1) to avoid double-triggering
+when routed through both ZynMidiRouter and direct synth connections.
 
 ### Limitations
 

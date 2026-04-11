@@ -967,7 +967,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         if (onsetFired) {
             if (self->goertzelNoteWindow <= 0)
                 self->goertzelPolyOnCount = 0;  // new strum — reset count
-            self->goertzelNoteWindow = static_cast<int>(self->sampleRate * 0.05);  // 50ms
+            self->goertzelNoteWindow = static_cast<int>(self->sampleRate * 0.06);  // 60ms  [tuned 2026-04-11]
         }
         if (self->goertzelNoteWindow > 0)
             self->goertzelNoteWindow -= static_cast<int>(nSamples);

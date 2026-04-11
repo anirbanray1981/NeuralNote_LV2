@@ -1168,7 +1168,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         if (onsetFired) {
             if (m->goertzelNoteWindow <= 0)
                 m->goertzelPolyOnCount = 0;  // new strum — reset count
-            m->goertzelNoteWindow = static_cast<int>(m->sampleRate * 0.05);  // 50ms
+            m->goertzelNoteWindow = static_cast<int>(m->sampleRate * 0.06);  // 60ms  [tuned 2026-04-11]
         }
         if (m->goertzelNoteWindow > 0)
             m->goertzelNoteWindow -= static_cast<int>(nFrames);

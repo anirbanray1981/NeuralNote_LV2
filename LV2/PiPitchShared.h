@@ -213,12 +213,15 @@ struct PitchBendTracker {
 static constexpr int MIDI_QUEUE_CAP = 64; // events between audio callbacks; 64 is ample
 
 // ── Pending MIDI event ────────────────────────────────────────────────────────
-// type: NOTE_ON, NOTE_OFF, or PITCH_BEND.
+// type: NOTE_ON, NOTE_OFF, PITCH_BEND, or VEL_BOOST.
 // For NOTE_ON/OFF: pitch = MIDI note, value = velocity (0–127).
 // For PITCH_BEND:  pitch = unused, value = 14-bit bend (0–16383, center=8192).
+// For VEL_BOOST:   pitch = MIDI note, value = new velocity.  Sent as Poly Key
+//                  Pressure (MIDI 0xA0) so the synth updates dynamics without
+//                  retriggering the ADSR envelope.
 
 struct PendingNote {
-    enum Type : uint8_t { NOTE_ON, NOTE_OFF, PITCH_BEND } type;
+    enum Type : uint8_t { NOTE_ON, NOTE_OFF, PITCH_BEND, VEL_BOOST } type;
     int pitch;
     int value;
 
@@ -228,6 +231,8 @@ struct PendingNote {
         : type(noteOn ? NOTE_ON : NOTE_OFF), pitch(p), value(v) {}
     static PendingNote bend(int bendValue)
         { PendingNote e; e.type = PITCH_BEND; e.pitch = 0; e.value = bendValue; return e; }
+    static PendingNote velBoost(int p, int v)
+        { PendingNote e; e.type = VEL_BOOST; e.pitch = p; e.value = v; return e; }
 };
 
 // ── Lockless SPSC MIDI output queue (worker → audio thread) ──────────────────
@@ -1238,6 +1243,13 @@ static void runWorkerCommon(Hooks& h)
                     std::chrono::steady_clock::now() - t0).count();
                 buildNNBits(r, ampFloor, newBits, newVel);
 
+                // Clamp CNN velocities: vel=0 is MIDI note-OFF by convention,
+                // so any detected note must have vel >= 1.  Also gives the log
+                // hook meaningful values for confirmed notes.
+                for (int b = 0; b < NOTE_COUNT; ++b)
+                    if (newVel[b] == 0 && (newBits & (1ULL << b)))
+                        newVel[b] = 1;
+
                 // Read what Goertzel currently has sounding, masked to this range
                 const uint64_t goertzelAll =
                     r.goertzelPolyActiveBits.load(std::memory_order_acquire);
@@ -1252,11 +1264,14 @@ static void runWorkerCommon(Hooks& h)
                 const uint64_t goertzelBits = goertzelAll & rangeMask;
                 newBits &= rangeMask;  // CNN output also filtered to this range
 
-                // Confirm: notes CNN agrees with → boost velocity (once)
+                // Confirm: CNN agrees with Goertzel scout → boost velocity from
+                // the muted scout vel (40) to full (100).  Sent as VEL_BOOST
+                // (Poly Key Pressure) so the synth updates dynamics without
+                // retriggering the ADSR envelope.
                 const uint64_t confirmed = newBits & goertzelBits;
                 for (uint64_t tmp = confirmed & ~r.goertzelCNNConfirmed; tmp; tmp &= tmp - 1) {
                     const int bit = __builtin_ctzll(tmp);
-                    r.midiOut.push({true, NOTE_BASE + bit, 100});  // velocity boost
+                    r.midiOut.push(PendingNote::velBoost(NOTE_BASE + bit, 100));
                     r.goertzelVetoCount[bit] = 0;
                 }
                 r.goertzelCNNConfirmed |= confirmed;
@@ -1314,7 +1329,12 @@ static void runWorkerCommon(Hooks& h)
                 h.onGoertzelPolyResult(r, goertzelBits, newBits,
                     confirmed & ~(prevActive & goertzelBits),  // newly confirmed
                     added, vetoNow, inferMs);
-                h.onNotesChanged(r, prevActive, newVel, inferMs, "GoertzelPoly");
+
+                // For the log hook: scout-inherited notes were already logged
+                // in the audio thread; suppress them from onNotesChanged so
+                // only genuinely new CNN-added notes appear as ON events.
+                const uint64_t logPrev = prevActive | goertzelBits;
+                h.onNotesChanged(r, logPrev, newVel, inferMs, "GoertzelPoly");
                 continue;  // skip cancel grace / applyNotesDiff — handled above
 
             } else {
@@ -1427,11 +1447,11 @@ static void runWorkerCommon(Hooks& h)
                            swiftMono ? r.cfg.swiftHoldCycles : -1);
 
             // Velocity boost: muted provisional confirmed by SwiftF0.
-            // Send a full-velocity Note-ON for the active note to replace
-            // the muted provisional's vel 40.
+            // Use VEL_BOOST (Poly Key Pressure) instead of note-ON to avoid
+            // retriggering the synth's ADSR envelope.
             if (r.provNeedsBoost && r.activeNotes) {
                 const int boostNote = NOTE_BASE + __builtin_ctzll(r.activeNotes);
-                r.midiOut.push({true, boostNote, 100});
+                r.midiOut.push(PendingNote::velBoost(boostNote, 100));
                 r.provNeedsBoost = false;
             } else if (!r.activeNotes) {
                 r.provNeedsBoost = false;

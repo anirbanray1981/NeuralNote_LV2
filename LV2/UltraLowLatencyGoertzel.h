@@ -353,6 +353,19 @@ private:
         float raw[52];
         std::memcpy(raw, m, numNotes_ * sizeof(float));
 
+        // True-harmonic suppression (both modes): H2 at i-12, H3 at i-19,
+        // H4 at i-24, H5 ≈ i-28, H6 ≈ i-31 are real harmonics of bin i-X,
+        // plus near-neighbours for spectral-leakage slop.
+        //
+        // Interval suppressions (i-4/-5/-7/-15/-16) are not harmonics — they
+        // happen to match chord intervals. In mono they usefully reject
+        // sympathetic-string artefacts; in poly they kill legitimate chord
+        // tones (e.g. B and D of a G major chord are at root+4 and root+7).
+        // Gated on !polyMode_.
+        //
+        // Original order preserved exactly so compound `val *= X` chains
+        // produce byte-identical mono results.
+        const bool mono = !polyMode_;
         for (int i = 0; i < numNotes_; ++i) {
             float val = m[i];
             if (val < HARMONIC_MAG_FLOOR) continue;
@@ -360,31 +373,33 @@ private:
             // Check against ORIGINAL magnitudes (raw[]) so earlier suppression
             // doesn't affect later comparisons.
             if (i >= 11 && raw[i - 11] > val * 0.15f) val *= 0.01f;  // near-octave (leakage from H2)
-            if (i >= 12 && raw[i - 12] > val * 0.15f) val *= 0.01f;  // octave
+            if (i >= 12 && raw[i - 12] > val * 0.15f) val *= 0.01f;  // octave (H2)
             if (i >= 13 && raw[i - 13] > val * 0.15f) val *= 0.01f;  // near-octave+1
             if (i >= 23 && raw[i - 23] > val * 0.15f) val *= 0.01f;  // near-2oct
-            if (i >= 24 && raw[i - 24] > val * 0.15f) val *= 0.01f;  // 2 octaves
+            if (i >= 24 && raw[i - 24] > val * 0.15f) val *= 0.01f;  // 2 octaves (H4)
             if (i >= 25 && raw[i - 25] > val * 0.15f) val *= 0.01f;  // near-2oct+1
-            if (i >= 7  && raw[i - 7]  > val * 0.15f) val *= 0.02f;  // fifth
-            if (i >= 19 && raw[i - 19] > val * 0.15f) val *= 0.02f;  // octave+fifth
-            if (i >= 4  && raw[i - 4]  > val * 0.3f)  val *= 0.05f;  // major third
-            if (i >= 5  && raw[i - 5]  > val * 0.3f)  val *= 0.05f;  // fourth
-            if (i >= 16 && raw[i - 16] > val * 0.2f)  val *= 0.02f;  // octave+fourth
-            if (i >= 15 && raw[i - 15] > val * 0.2f)  val *= 0.02f;  // oct+minor third (H3 leakage)
-            if (i >= 28 && raw[i - 28] > val * 0.15f) val *= 0.01f;  // 2oct+third
+            if (mono && i >= 7  && raw[i - 7]  > val * 0.15f) val *= 0.02f;  // fifth (interval)
+            if (i >= 19 && raw[i - 19] > val * 0.15f) val *= 0.02f;  // octave+fifth (H3)
+            if (mono && i >= 4  && raw[i - 4]  > val * 0.3f)  val *= 0.05f;  // major third (interval)
+            if (mono && i >= 5  && raw[i - 5]  > val * 0.3f)  val *= 0.05f;  // fourth (interval)
+            if (mono && i >= 16 && raw[i - 16] > val * 0.2f)  val *= 0.02f;  // octave+fourth (interval)
+            if (mono && i >= 15 && raw[i - 15] > val * 0.2f)  val *= 0.02f;  // oct+minor third (interval)
+            if (i >= 28 && raw[i - 28] > val * 0.15f) val *= 0.01f;  // 2oct+third (H5)
             if (i >= 31 && raw[i - 31] > val * 0.15f) val *= 0.01f;  // 2oct+fifth (H6)
             m[i] = val;
         }
 
-        // Winner-takes-all per octave — incumbent advantage.
-        // An already-ON note needs the competitor to be WTA_INCUMBENT_MULT×
-        // stronger to be dethroned.  Prevents decay-phase toggling between
-        // adjacent semitones while still allowing real note transitions
-        // (new pick attack easily exceeds the margin).
+        // Winner-takes-all — adjacent-bin suppression.
+        // Mono: ±6 semitones (drops any competing note within a tritone of
+        // the current one; correct because mono never plays two such notes).
+        // Poly: narrower window so chord tones coexist but harmonic
+        // false positives still get suppressed. Compile-time tunable for
+        // A/B measurement.
+        const int wtaHalf = polyMode_ ? 2 : 6;
         for (int i = 0; i < numNotes_; ++i) {
             if (m[i] <= 0.0f) continue;
-            const int lo = std::max(0, i - 6);
-            const int hi = std::min(numNotes_ - 1, i + 5);
+            const int lo = std::max(0, i - wtaHalf);
+            const int hi = std::min(numNotes_ - 1, i + wtaHalf - (polyMode_ ? 0 : 1));
             float maxCompetitor = 0.0f;
             for (int k = lo; k <= hi; ++k)
                 if (k != i && m[k] > maxCompetitor) maxCompetitor = m[k];

@@ -435,6 +435,13 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 const uint8_t msb = static_cast<uint8_t>((pn.value >> 7) & 0x7F);
                 writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
                           PITCH_BEND_STATUS, lsb, msb);
+            } else if (pn.type == PendingNote::VEL_BOOST) {
+                // Poly Key Pressure: updates dynamics without ADSR retrigger
+                static constexpr uint8_t POLY_AT_STATUS = 0xA0 | MIDI_CH;
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          POLY_AT_STATUS,
+                          static_cast<uint8_t>(pn.pitch),
+                          static_cast<uint8_t>(pn.value));
             } else {
                 writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
                           pn.type == PendingNote::NOTE_ON ? NOTE_ON_STATUS : NOTE_OFF_STATUS,
@@ -967,7 +974,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         if (onsetFired) {
             if (self->goertzelNoteWindow <= 0)
                 self->goertzelPolyOnCount = 0;  // new strum — reset count
-            self->goertzelNoteWindow = static_cast<int>(self->sampleRate * 0.05);  // 50ms
+            self->goertzelNoteWindow = static_cast<int>(self->sampleRate * 0.06);  // 60ms  [tuned 2026-04-11]
         }
         if (self->goertzelNoteWindow > 0)
             self->goertzelNoteWindow -= static_cast<int>(nSamples);
@@ -1031,6 +1038,12 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 const uint8_t msb = static_cast<uint8_t>((pn.value >> 7) & 0x7F);
                 writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
                           PITCH_BEND_STATUS, lsb, msb);
+            } else if (pn.type == PendingNote::VEL_BOOST) {
+                static constexpr uint8_t POLY_AT_STATUS = 0xA0 | MIDI_CH;
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          POLY_AT_STATUS,
+                          static_cast<uint8_t>(pn.pitch),
+                          static_cast<uint8_t>(pn.value));
             } else {
                 writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
                           pn.type == PendingNote::NOTE_ON ? NOTE_ON_STATUS : NOTE_OFF_STATUS,

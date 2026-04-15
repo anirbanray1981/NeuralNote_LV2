@@ -508,9 +508,22 @@ static void processSynth(Monitor* m, float* out, int nFrames)
                 std::printf("[+%.3fs]  >>   BEND %+.0f cents  (val %5d)  [range %s]\n",
                             elapsed, cents, pn.value, rp->cfg.name.c_str());
                 std::fflush(stdout);
+            } else if (pn.type == PendingNote::VEL_BOOST) {
+                // CNN confirmed a scout note → boost velocity without retrigger
+                for (int i = 0; i < MAX_VOICES; ++i) {
+                    if (m->voices[i].pitch == pn.pitch && m->voices[i].state != 0 && m->voices[i].state != 3) {
+                        m->voices[i].velocity = pn.value / 127.0f;
+                        std::printf("[+%.3fs]  >>   %-4s (%3d)  vel %3d"
+                                    "  [synth BOOST range %s]\n",
+                                    elapsed, midiToName(pn.pitch).c_str(),
+                                    pn.pitch, pn.value, rp->cfg.name.c_str());
+                        std::fflush(stdout);
+                        break;
+                    }
+                }
             } else if (pn.type == PendingNote::NOTE_ON) {
-                // Check if this note is already playing — if so, just boost velocity
-                // (don't retrigger envelope). This handles the muted→full velocity boost.
+                // New note-ON: check if already playing (shouldn't happen now
+                // that confirms use VEL_BOOST, but handle gracefully)
                 bool boosted = false;
                 for (int i = 0; i < MAX_VOICES; ++i) {
                     if (m->voices[i].pitch == pn.pitch && m->voices[i].state != 0 && m->voices[i].state != 3) {
@@ -1168,7 +1181,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         if (onsetFired) {
             if (m->goertzelNoteWindow <= 0)
                 m->goertzelPolyOnCount = 0;  // new strum — reset count
-            m->goertzelNoteWindow = static_cast<int>(m->sampleRate * 0.05);  // 50ms
+            m->goertzelNoteWindow = static_cast<int>(m->sampleRate * 0.06);  // 60ms  [tuned 2026-04-11]
         }
         if (m->goertzelNoteWindow > 0)
             m->goertzelNoteWindow -= static_cast<int>(nFrames);
